@@ -53,11 +53,37 @@ def texto_formula(v):
     return None
 
 
+def blocos(celulas, vertical):
+    """Cada sequencia continua de celulas com o mesmo padrao vira uma linha de texto."""
+    grupos = defaultdict(list)  # (linha ou coluna fixa, padrao) -> posicoes que andam
+    for r, c, padrao in celulas:
+        if vertical:
+            grupos[(c, padrao)].append(r)
+        else:
+            grupos[(r, padrao)].append(c)
+
+    def ref(fixo, pos):
+        return f"{get_column_letter(fixo)}{pos}" if vertical else f"{get_column_letter(pos)}{fixo}"
+
+    saida = []
+    for (fixo, padrao), posicoes in grupos.items():
+        posicoes.sort()
+        ini = ant = posicoes[0]
+        for p in posicoes[1:] + [None]:
+            if p is not None and p == ant + 1:
+                ant = p
+                continue
+            faixa = ref(fixo, ini) if ini == ant else f"{ref(fixo, ini)}:{ref(fixo, ant)}"
+            saida.append(f"{faixa}\t{padrao}")
+            if p is not None:
+                ini = ant = p
+    return saida
+
+
 def medir_aba(ws_f, ws_v):
     valores = {(c.row, c.column): c.value
                for linha in ws_v.iter_rows() for c in linha if c.value is not None}
-    bruto, consts = [], []
-    grupos = defaultdict(list)  # (coluna, padrao) -> linhas
+    bruto, consts, celulas = [], [], []  # celulas: (linha, coluna, padrao)
     n_formulas = 0
     for linha in ws_f.iter_rows():
         for c in linha:
@@ -71,23 +97,12 @@ def medir_aba(ws_f, ws_v):
                 continue
             n_formulas += 1
             bruto.append(f"{ref}\t{f}\t{valores.get((c.row, c.column))}")
-            grupos[(c.column, relativa(f, c.row, c.column))].append(c.row)
+            celulas.append((c.row, c.column, relativa(f, c.row, c.column)))
 
-    # Cada sequencia continua de linhas com o mesmo padrao vira uma linha de texto.
-    # ponytail: agrupa so na vertical; agrupar em 2D (matriz PDD) se compensar.
-    agrupado = []
-    for (col, padrao), linhas in grupos.items():
-        linhas.sort()
-        ini = ant = linhas[0]
-        for r in linhas[1:] + [None]:
-            if r is not None and r == ant + 1:
-                ant = r
-                continue
-            letra = get_column_letter(col)
-            faixa = f"{letra}{ini}" if ini == ant else f"{letra}{ini}:{letra}{ant}"
-            agrupado.append(f"{faixa}\t{padrao}")
-            if r is not None:
-                ini = ant = r
+    # Usa a direcao que gera menos texto: coluna (linhas no tempo) ou linha (meses nas colunas).
+    # ponytail: uma direcao por aba; agrupar em 2D (matriz PDD) se compensar.
+    agrupado = min(blocos(celulas, True), blocos(celulas, False),
+                   key=lambda b: len("\n".join(b)))
 
     return {
         "formulas": n_formulas,
@@ -131,6 +146,10 @@ def autoteste():
     # xlsx guarda formula em ingles com virgula; texto entre aspas nao muda
     assert relativa('=IF(A2="B2",1,0)', 2, 2) == '=IF(R[0]C[-1]="B2",1,0)'
     assert relativa("=_xlfn.XLOOKUP(A2,Base!A:A,Base!C:C)", 2, 2) == "=_xlfn.XLOOKUP(R[0]C[-1],Base!A:A,Base!C:C)"
+    em_coluna = [(r, 5, "p") for r in range(2, 100)]
+    em_linha = [(3, c, "p") for c in range(2, 100)]
+    assert blocos(em_coluna, True) == ["E2:E99\tp"]
+    assert blocos(em_linha, False) == ["B3:CU3\tp"]
     print("auto-teste ok")
 
 
