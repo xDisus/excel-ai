@@ -3,7 +3,8 @@ title: "feat: Read VBA macros"
 type: feat
 date: 2026-10-17
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: implementation-ready
+status: deferred
+artifact_readiness: deferred
 execution: code
 product_contract_source: ce-plan-bootstrap
 depth: deep
@@ -143,3 +144,9 @@ R1 to R7 met for the shipped tiers, caps enforced, legend and README updated, au
 - `redigir` é best-effort: valor sem aspas de `password=`/`key=` vai até `;`, `,`, `&` ou fim de linha; caminhos POSIX só em /home,/Users,/root,/mnt,/media,/var,/tmp,/opt. Nos testes, plante segredos reais (`hunter2`) e confira que sumiram E que o resto ficou.
 - Teste só com venv: `/tmp/claude-0/venv/bin/python excel_ai.py` (sem openpyxl no sistema). Mantenha o fonte em ASCII e compatível com Python 3.8.
 - Verificação R5: compare `converter()` de fixture, `--celula` e `--diff` contra a saída da `main` antes do plano.
+
+## Resultado da execução (adiado, não implementado)
+
+Decisão do ship-plans, seguindo o gate KTD6: não há `.xlsm` real no repositório nem na máquina, então nem o leitor CFB (U1) nem a listagem de módulos (U2) poderiam ser validados contra o que o Excel realmente grava; um CFB sintético escrito por nós só prova que lemos o que nós mesmos escrevemos. U1+U2 sozinhos dão só nomes de módulos, pouco além do aviso atual (`File has VBA macros`), e acrescentam ~100 linhas de parser de formato binário em entrada não confiável. U3 (decompressão MS-OVBA e código-fonte) exige o mesmo arquivo real.
+
+**Para retomar:** precisa de um `.xlsm` real (pode ser anonimizado) fornecido pelo usuário, e que ele confirme que quer a leitura de macros. Depois: trocar `status`/`artifact_readiness` de volta para `implementation-ready`, e rodar `/ship-plans`. Os helpers `redigir`, `ler_membro` e `secoes_livro["Macros"]` já existem (plano 008/011).
