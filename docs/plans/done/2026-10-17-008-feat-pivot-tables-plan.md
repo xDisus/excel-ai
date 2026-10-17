@@ -3,6 +3,7 @@ title: "feat: Read pivot tables"
 type: feat
 date: 2026-10-17
 artifact_contract: ce-unified-plan/v1
+status: completed
 artifact_readiness: implementation-ready
 execution: code
 product_contract_source: ce-plan-bootstrap
@@ -147,3 +148,7 @@ A pivot's cells are plain values in the sheet. The AI cannot tell that `Resumo!A
 ## Definition of Done
 
 R1 to R8 met, legend updated, README updated, auto-test green, existing fixture output unchanged.
+
+## Resultado da execução
+
+Entregue no PR #14. Revisão adversarial: P0/P1 de `redigir` corrigidos. P2 abertos: sem aviso quando o cache não tem registros (`saveData=0`); pivot de livro externo aparece como intervalo local (openpyxl não expõe); nomes de campo não passam por `redigir`. Validação em planilha real: pendente.
