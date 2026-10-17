@@ -32,6 +32,15 @@ python excel_ai.py sua_planilha.xlsx
 Gera `sua_planilha.ai.txt` ao lado da planilha. É esse arquivo que você manda para a IA.
 Na tela aparecem só números: tokens antes e depois, e o resultado da conferência.
 
+Se a planilha tem tabelas dinâmicas, o arquivo ganha uma seção `## Pivots` por aba: onde a tabela está, o que a alimenta e quais campos são linhas, colunas, filtros e valores.
+
+```
+## Pivots
+- 'Piv1' at A3:B8, source 'Dados'!A1:C6
+  rows: Mes
+  values: Soma de Valor = sum(Valor)
+```
+
 Para olhar uma conta só (por exemplo a TIR final), passe a célula:
 
 ```
