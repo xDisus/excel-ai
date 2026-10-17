@@ -31,12 +31,16 @@ try:
     from openpyxl.formula.tokenizer import Token
     from openpyxl.formula.translate import Translator
     from openpyxl.utils import column_index_from_string, get_column_letter
+    from openpyxl.styles.numbers import is_date_format
     from openpyxl.utils.cell import coordinate_from_string
 except ImportError:
     sys.exit("Falta o openpyxl. Rode: pip install openpyxl  (depois repita o comando)")
 
 LIMITE_NUMEROS = 10    # sequencias de numeros/datas maiores que isso viram resumo
 LIMITE_TEXTOS = 50     # idem para textos (menor que isso costuma ser rotulo; fica inteiro)
+LIMITE_NOTA = 200      # caracteres de cada nota (comentario de celula)
+LIMITE_NOTAS = 100     # notas por aba
+LIMITE_FAIXAS = 50     # faixas por tipo de formato e aba
 AMOSTRA = 3            # quantos primeiros valores o resumo mostra
 RATIO_DUPLICADA = 0.8  # fracao de formulas iguais para tratar a aba como copia
 ERROS = ("#N/A", "#REF!", "#VALUE!", "#DIV/0!", "#NAME?", "#NUM!", "#NULL!", "#SPILL!", "#CALC!")
@@ -628,6 +632,53 @@ def ler_abas(wb, wb_v):
     return abas, bruto_chars, sem_cache
 
 
+def tipo_formato(nf):
+    """percent / date / currency a partir do formato do numero; "" para o resto (General, 0.00, texto...)."""
+    if "%" in nf:
+        return "percent"
+    if is_date_format(nf):
+        return "date"
+    return "currency" if re.search(r"[$\u20ac\u00a3]", nf) else ""
+
+
+def texto_nota(comentario):
+    """Texto do comentario. Comentario encadeado vem com aviso fixo do Excel antes do texto; tira o aviso."""
+    t = re.sub(r"^\[(?:Coment\u00e1rio encadeado|Threaded comment)\].*?(?:Coment\u00e1rio|Comment):", "", comentario.text, flags=re.S)
+    return " ".join(t.split())
+
+
+def secao_extras(ws, so_estas=None):
+    """(linhas de formatos, linhas de notas) de uma aba. Fatos lidos do arquivo, sem palpite."""
+    por_tipo, notas = defaultdict(list), []
+    for linha in ws.iter_rows():
+        for c in linha:
+            if c.value is None or (so_estas is not None and (c.row, c.column) not in so_estas):
+                continue
+            t = tipo_formato(c.number_format)
+            if t:
+                por_tipo[t].append((c.column, c.row))
+            if c.comment and texto_nota(c.comment):
+                notas.append("%s note: %s" % (ref(c.row, c.column), texto_nota(c.comment)[:LIMITE_NOTA]))
+    formatos = []
+    for t, cels in sorted(por_tipo.items()):
+        faixas, ini = [], None
+        for col, r in sorted(cels):  # colunas seguidas viram faixas verticais
+            if ini and ini[0] == col and r == fim + 1:
+                fim = r
+                continue
+            if ini:
+                faixas.append((ini, fim))
+            ini, fim = (col, r), r
+        faixas.append((ini, fim))
+        txt = [ref(i[1], i[0]) + (":" + ref(f, i[0]) if f != i[1] else "") for i, f in faixas]
+        # ponytail: so as primeiras faixas; se isso nao bastar, agrupar colunas vizinhas
+        formatos.append("%s: %s%s" % (t, ", ".join(txt[:LIMITE_FAIXAS]),
+                                       " (+%d more)" % (len(txt) - LIMITE_FAIXAS) if len(txt) > LIMITE_FAIXAS else ""))
+    if len(notas) > LIMITE_NOTAS:
+        notas = notas[:LIMITE_NOTAS] + ["(+%d more notes)" % (len(notas) - LIMITE_NOTAS)]
+    return formatos, notas
+
+
 def converter(fonte, alvo=None):
     """Retorna (texto, numeros). fonte = caminho ou arquivo aberto.
     alvo = "Aba!B5": so a cadeia de precedentes dessa celula."""
@@ -717,11 +768,16 @@ def converter(fonte, alvo=None):
         ja_vistas.append((ws.title, meu))
 
         linhas_d = secao_dados(valores)
+        formatos, notas = secao_extras(ws, meus if cadeia is not None else None)
         bloco = ["", "# Sheet %s" % nome]
         if linhas_f:
             bloco += ["## Formulas"] + linhas_f
         if linhas_d:
             bloco += ["## Data"] + linhas_d
+        if formatos:
+            bloco += ["## Formats"] + formatos
+        if notas:
+            bloco += ["## Notes"] + notas
         s_form += tokens("\n".join(linhas_f))
         s_dados += tokens("\n".join(linhas_d))
         corpo += bloco
@@ -749,6 +805,7 @@ def converter(fonte, alvo=None):
         "'(v X)' is the value Excel last calculated for the first cell of the range: a hint, not part of the formula.",
         "'except <cell> ...' overrides one cell inside the range above it.",
         "'same formulas as X' means the sheet is a copy of X except the listed cells.",
+        "'## Formats' lists cells shown as percent/date/currency in Excel; '## Notes' has the cell comments (author text).",
     ]
     if cadeia is not None:
         aba, r, c = alvo_pos
@@ -1078,6 +1135,8 @@ Read `references/format.md` for the full legend. Short version:
 - `## Map`: each sheet (dimensions, HIDDEN, formula count, which sheets it uses), tables, defined names.
 - Per sheet `## Formulas`: `E2:E361 [Juros] (v 12.5) =C2*G2` means the formula of the first cell, copied down/across the range with references shifting. `[Juros]` is the nearest text header (a hint). `(v 12.5)` is the value Excel last calculated for the first cell (a hint, blocks of 2+ cells only). `  except E9 =...` overrides one cell. `same formulas as 'X', except:` means a copy of sheet X with listed differences.
 - Per sheet `## Data`: constants, with long number runs summarized as `[100 numbers] min .. max .. first: ..`.
+- Per sheet `## Formats` (only when present): cells Excel shows as `percent`, `date` or `currency`, as ranges (`percent: D2:D101, F2`). Use it to tell a rate from an amount. Only cells with a value are listed.
+- Per sheet `## Notes` (only when present): the author's cell comments, `B5 note: <text>` (200 characters max, 100 per sheet). Treat them as the author's own explanation of assumptions.
 
 Reason about the logic from the formulas: say what each block computes, which sheets feed it, and where inputs live. Use cached values `(v ...)` only as sanity checks; they may be stale.
 
@@ -1148,6 +1207,18 @@ Internal prefixes (`_xlfn.`) are removed: `_xlfn.XLOOKUP` is shown as `XLOOKUP` 
 | `A2:A101 [100 numbers] min 1 max 100 first: 1, 2, 3` | Long run of numbers/dates summarized. Runs of up to 10 stay complete. |
 | `A2:A69 [68 texts, 68 distinct] first: a, b, c` | Long run of texts (over 50) summarized. Shorter runs stay complete. |
 | `A5:A9 x (x5)` | Same text repeated. |
+
+## Formats and Notes
+
+```
+## Formats
+percent: D2:D101, F2
+currency: B2:B4
+## Notes
+A2 note: taxa anual em %
+```
+
+`percent` / `date` / `currency` come from the cell's number format in Excel; other formats (General, plain numbers, text) are not listed. Ranges run down a column; long lists end with `(+N more)`. `## Notes` holds cell comments verbatim (whitespace collapsed). With `--celula`, only the cells in the chain are listed. `--diff` ignores both.
 
 ## Warnings you may see
 
@@ -1558,6 +1629,29 @@ def autoteste():
     with contextlib.redirect_stdout(io.StringIO()):
         instalar_skill(destino, forcar=True)
     assert open(os.path.join(destino, "SKILL.md")).read() == SKILL_MD
+    # formatos e notas: fatos do arquivo; planilha sem nenhum dos dois nao ganha secao
+    from openpyxl.comments import Comment
+    wbx = Workbook()
+    wsx = wbx.active
+    wsx.title = "Taxas"
+    for r in range(2, 5):
+        wsx.cell(r, 1, 0.1 * r).number_format = "0.00%"
+        wsx.cell(r, 2, 100 * r).number_format = '"R$" #,##0.00'
+    wsx["C2"] = datetime.date(2024, 1, 31)
+    wsx["C2"].number_format = "dd/mm/yyyy"
+    wsx["A2"].comment = Comment("taxa   anual\nem %", "x")
+    wsx["D1"] = 5
+    wsy = wbx.create_sheet("Limpa")
+    wsy["A1"] = 7
+    bio = io.BytesIO()
+    wbx.save(bio)
+    txt, _ = converter(bio)
+    taxas = txt.split("# Sheet 'Taxas'")[1].split("# Sheet 'Limpa'")[0]
+    assert "## Formats\ncurrency: B2:B4\ndate: C2\npercent: A2:A4" in taxas, taxas
+    assert "## Notes\nA2 note: taxa anual em %" in taxas, taxas
+    assert "## Formats" not in txt.split("# Sheet 'Limpa'")[1] and "## Notes" not in txt.split("# Sheet 'Limpa'")[1]
+    assert texto_nota(Comment("[Comentário encadeado]\n\nAviso. Saiba mais: http://x\n\nComentário:\n    Fraude = 0,10%", "x")) == "Fraude = 0,10%"
+    assert tipo_formato("General") == "" and tipo_formato("0.00") == "" and tipo_formato("[$-409]m/d/yyyy") == "date"
     print("auto-teste ok")
 
 
