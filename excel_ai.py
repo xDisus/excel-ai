@@ -3,6 +3,7 @@
 Uso:   python excel_ai.py planilha.xlsx     (gera planilha.ai.txt ao lado)
        python excel_ai.py planilha.xlsx --celula "Aba!B5"   (so o que essa celula usa)
        python excel_ai.py antiga.xlsx nova.xlsx --diff      (so o que mudou entre as duas)
+       python excel_ai.py pasta                             (todas as planilhas da pasta)
 Teste: python excel_ai.py                   (sem argumento roda o auto-teste)
 
 Roda 100% local. Unica dependencia: openpyxl (pip install openpyxl).
@@ -930,6 +931,22 @@ def main(caminho, alvo=None):
     return 1 if n["falhas"] else 0
 
 
+def main_pasta(pasta):
+    """Converte cada planilha da pasta com main(); um arquivo ruim nao para os outros."""
+    nomes = sorted(n for n in os.listdir(pasta)
+                   if n.lower().endswith((".xlsx", ".xlsm")) and not n.startswith("~$")
+                   and os.path.isfile(os.path.join(pasta, n)))
+    if not nomes:
+        sys.stderr.write("erro: nenhuma planilha .xlsx/.xlsm na pasta: %s\n" % ascii(pasta))
+        return 2
+    codigos = []
+    for n in nomes:
+        print("== %s ==" % n.encode("ascii", "backslashreplace").decode())
+        codigos.append(main(os.path.join(pasta, n)))
+    print("Pasta: %d planilha(s), %d com problema" % (len(nomes), sum(1 for c in codigos if c)))
+    return max(codigos)
+
+
 def _fixture():
     from openpyxl.workbook.defined_name import DefinedName
     from openpyxl.worksheet.formula import ArrayFormula
@@ -1310,6 +1327,29 @@ def autoteste():
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert uso.returncode == 2 and b"uso:" in uso.stderr
 
+    # pasta inteira
+    sub = os.path.join(pasta, "lote")
+    os.makedirs(os.path.join(sub, "fundo"))
+    for nome_x in ("b.xlsx", "a.XLSM", os.path.join("fundo", "c.xlsx")):
+        with open(os.path.join(sub, nome_x), "wb") as arq:
+            arq.write(_fixture().getvalue())
+    for nome_x in ("~$a.xlsx", "ruim.xlsx", "nota.txt"):
+        with open(os.path.join(sub, nome_x), "wb") as arq:
+            arq.write(b"nao e planilha")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        assert main_pasta(sub) == 2
+    assert os.path.isfile(os.path.join(sub, "a.ai.txt")) and os.path.isfile(os.path.join(sub, "b.ai.txt"))
+    assert not os.path.exists(os.path.join(sub, "ruim.ai.txt")) and not os.path.exists(os.path.join(sub, "fundo", "c.ai.txt"))
+    assert "Pasta: 3 planilha(s), 1 com problema" in out.getvalue() and "== a.XLSM ==" in out.getvalue(), out.getvalue()
+    vazia = os.path.join(pasta, "vazia")
+    os.makedirs(vazia)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        assert main_pasta(vazia) == 2
+    uso = subprocess.run([sys.executable, os.path.abspath(__file__), os.path.join(sub, "fundo")],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert uso.returncode == 0 and b"Pasta: 1 planilha(s), 0 com problema" in uso.stdout, uso.stdout
+
     # macro: zip com vbaProject.bin
     z = io.BytesIO()
     with zipfile.ZipFile(z, "w") as arq:
@@ -1324,8 +1364,8 @@ if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[3] == "--diff":
         sys.exit(main_diff(sys.argv[1], sys.argv[2]))
     if len(sys.argv) == 2:
-        sys.exit(main(sys.argv[1]))
+        sys.exit(main_pasta(sys.argv[1]) if os.path.isdir(sys.argv[1]) else main(sys.argv[1]))
     if len(sys.argv) > 1:
-        sys.stderr.write("uso: python excel_ai.py planilha.xlsx [--celula Aba!B5]  |  python excel_ai.py antiga.xlsx nova.xlsx --diff\n")
+        sys.stderr.write("uso: python excel_ai.py planilha.xlsx [--celula Aba!B5]  |  python excel_ai.py antiga.xlsx nova.xlsx --diff  |  python excel_ai.py pasta\n")
         sys.exit(2)
     autoteste()
