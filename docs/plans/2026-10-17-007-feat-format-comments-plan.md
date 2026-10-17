@@ -3,6 +3,7 @@ title: "feat: Number-format hints and cell comments - Plan"
 type: feat
 date: 2026-10-17
 artifact_contract: ce-unified-plan/v1
+status: completed
 artifact_readiness: requirements-only
 product_contract_source: ce-brainstorm
 ---
