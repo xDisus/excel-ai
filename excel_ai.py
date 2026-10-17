@@ -123,9 +123,9 @@ def rotulo(formulas, valores, r, c, dr, dc):
         if (r, c) in formulas:
             return ""
         v = valores.get((r, c))
-        if v is None:
+        if v is None or (isinstance(v, str) and not v.strip()):
             continue
-        if not isinstance(v, str) or len(re.findall(r"[^\W\d_]", v)) < 2:
+        if not isinstance(v, str) or v.startswith("#") or len(re.findall(r"[^\W\d_]", v)) < 2:
             return ""
         return " ".join(re.sub(r"[\[\]]", "", v).split())[:30].strip()
     return None
@@ -185,7 +185,8 @@ def blocos(formulas, valores, vertical, buraco="blank"):
                 if nome is None:
                     nome = rotulo(formulas, valores, ini[0], ini[1], -1, 0)
             else:
-                nome = rotulo(formulas, valores, ini[0], ini[1], *((-1, 0) if vertical else (0, -1)))
+                dr, dc = (-1, 0) if vertical else (0, -1)
+                nome = rotulo(formulas, valores, ini[0], ini[1], dr, dc)
             if nome:
                 faixa += " [%s]" % nome
             saida.append("%s %s" % (faixa, limpa(formulas[ini][1])))
@@ -682,10 +683,17 @@ def autoteste():
     fh = {(3, c): ("f", "=%s1" % get_column_letter(c), relativa("=%s1" % get_column_letter(c), 3, c)) for c in range(3, 6)}
     assert blocos(fh, {(3, 1): "Total"}, False)[0] == "C3:E3 [Total] =C1"
     assert blocos(fh, {(3, 2): "%"}, False)[0] == "C3:E3 =C1"  # unidade nao e rotulo
+    assert blocos(fh, {(3, 2): "x"}, False)[0] == "C3:E3 =C1"  # uma letra so nao e rotulo
+    assert blocos(fh, {(3, 2): "#N/A"}, False)[0] == "C3:E3 =C1"  # erro nao e rotulo
+    assert blocos(fh, {(3, 2): "  ", (3, 1): "Total"}, False)[0] == "C3:E3 [Total] =C1"  # espaco = vazio
     um = {(4, 3): ("f", "=A1", relativa("=A1", 4, 3))}
     assert blocos(um, {(4, 2): 5, (3, 3): "TIR"}, True) == ["C4 =A1"]  # numero a esquerda: sem rotulo
     assert blocos(um, {(3, 3): "TIR"}, True) == ["C4 [TIR] =A1"]  # nada a esquerda: olha acima
+    assert blocos(um, {(4, 2): "Taxa", (3, 3): "TIR"}, True) == ["C4 [Taxa] =A1"]  # esquerda ganha
     assert expandir(["B5:B7 [Juros] =A5"]) == expandir(["B5:B7 =A5"])
+    certo = {"D%d" % r: "=B%d*C%d" % (r, r) for r in range(2, 11)}
+    assert confere(["D2:D10 [J] =B2*C2"], certo) and not confere(["D2:D10 [J] =B2*C3"], certo)
+    assert not confere(["D2:D10 [J =B2*C2"], certo)  # rotulo mal fechado nao passa
 
     # conferencia pega uma linha estragada
     linhas = ["D2:D10 =B2*C2"]
