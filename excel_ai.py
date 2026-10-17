@@ -34,7 +34,7 @@ PECA_LINHA = re.compile(r"^(\$?)(\d+)$")
 # ponytail: regex pode achar nome de aba dentro de texto entre aspas; raro, so afeta o mapa.
 NOME_ABA = r"'((?:[^']|'')+)'|([^\W\d][\w.]*)"  # 'Aba com espaco' ou Aba
 RE_ABA = re.compile(r"(?<![#\w.\]])(?:%s)!" % NOME_ABA)
-RE_BLOCO = re.compile(r"^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))? (=.*)$")
+RE_BLOCO = re.compile(r"^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))? (?:\[[^\]]*\] )?(=.*)$")
 RE_MATRIZ = re.compile(r"^([A-Z]+\d+) array (\S+) \{(=.*)\}$")
 RE_EXCECAO = re.compile(r"^  except ([A-Z]+\d+) (.*)$")
 RE_SUMIU = re.compile(r"^([A-Z]+\d+) no formula$")
@@ -113,6 +113,24 @@ def relativa(formula, row, col):
     return "=" + "".join(partes)
 
 
+def rotulo(formulas, valores, r, c, dr, dc):
+    """Texto de cabecalho mais perto na direcao (dr, dc). Pula ate 2 vazias.
+    None = nada achado; "" = achou algo que nao e rotulo (numero, formula, '%')."""
+    for _ in range(3):
+        r, c = r + dr, c + dc
+        if r < 1 or c < 1:
+            return None
+        if (r, c) in formulas:
+            return ""
+        v = valores.get((r, c))
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        if not isinstance(v, str) or v.startswith("#") or len(re.findall(r"[^\W\d_]", v)) < 2:
+            return ""
+        return " ".join(re.sub(r"[\[\]]", "", v).split())[:30].strip()
+    return None
+
+
 def blocos(formulas, valores, vertical, buraco="blank"):
     """Junta celulas vizinhas com o mesmo padrao. Uma celula diferente no meio vira 'except'."""
     por_linha = defaultdict(list)
@@ -162,6 +180,15 @@ def blocos(formulas, valores, vertical, buraco="blank"):
             if tipo != "f":
                 continue
             faixa = ref(*ini) if p0 == p1 else ref(*ini) + ":" + ref(*cel(p1))
+            if p0 == p1:  # celula sozinha: esquerda; acima so se a esquerda estiver vazia
+                nome = rotulo(formulas, valores, ini[0], ini[1], 0, -1)
+                if nome is None:
+                    nome = rotulo(formulas, valores, ini[0], ini[1], -1, 0)
+            else:
+                dr, dc = (-1, 0) if vertical else (0, -1)
+                nome = rotulo(formulas, valores, ini[0], ini[1], dr, dc)
+            if nome:
+                faixa += " [%s]" % nome
             saida.append("%s %s" % (faixa, limpa(formulas[ini][1])))
             for p in excecoes:
                 f = formulas.get(cel(p))
@@ -483,6 +510,7 @@ def converter(fonte):
         "# excel_ai dump",
         "How to read formulas: '<range> <formula>' gives the formula of the first cell;",
         "the rest of the range is the same formula copied (Excel fill), refs shifting as usual.",
+        "'[label]' after the range is the nearest text header (above a column, left of a row): a hint, not part of the formula.",
         "'except <cell> ...' overrides one cell inside the range above it.",
         "'same formulas as X' means the sheet is a copy of X except the listed cells.",
     ]
@@ -604,12 +632,12 @@ def autoteste():
     secoes = texto.split("\n# Sheet ")
     fluxo = [s for s in secoes if s.startswith("'Fluxo'")][0]
     # bloco com excecoes: formula diferente, numero e vazio no meio
-    assert "D2:D79 =B2*C2" in fluxo, fluxo
+    assert "D2:D79 [Juros] =B2*C2" in fluxo, fluxo
     assert "  except D50 =B50*0" in fluxo
     assert "  except D60 value 7" in fluxo
     assert "  except D70 blank" in fluxo
-    assert "D80 =1" in fluxo and "D81 =2" in fluxo and "D82:D101 =B82*C82" in fluxo
-    assert "C2:C101 =XLOOKUP(" in fluxo and "_xlfn" not in fluxo
+    assert "D80 =1" in fluxo and "D81 =2" in fluxo and "D82:D101 =B82*C82" in fluxo  # formula acima: sem rotulo
+    assert "C2:C101 [Taxa] =XLOOKUP(" in fluxo and "_xlfn" not in fluxo
     assert "F2 array F2:F4 {=B2:B4*2}" in fluxo
     assert "I2 =SUM(Tabela1[Valor])" in fluxo
     # meses nas colunas: agrupa na horizontal
@@ -643,6 +671,29 @@ def autoteste():
     assert "No calculated values saved" in texto
     assert "VBA" not in texto
     assert n["falhas"] == 0 and n["total_formulas"] > 0
+
+    # rotulo: cabecalho acima (coluna) ou a esquerda (linha); pula ate 2 vazias
+    fs = {(r, 2): ("f", "=A%d" % r, relativa("=A%d" % r, r, 2)) for r in range(5, 8)}
+    assert blocos(fs, {(2, 2): "Juros"}, True)[0] == "B5:B7 [Juros] =A5"
+    assert blocos(fs, {(1, 2): "Juros"}, True)[0] == "B5:B7 =A5"  # 3 vazias: longe demais
+    assert blocos(fs, {(4, 2): 12}, True)[0] == "B5:B7 =A5"  # numero nao e rotulo
+    assert blocos(fs, {(4, 2): "x [a]  muito   comprido " * 3}, True)[0] == "B5:B7 [x a muito comprido x a muito c] =A5"
+    fs[(4, 2)] = ("f", "=1", "=1")
+    assert blocos(fs, {(3, 2): "Juros"}, True)[1] == "B5:B7 =A5"  # formula acima para a busca
+    fh = {(3, c): ("f", "=%s1" % get_column_letter(c), relativa("=%s1" % get_column_letter(c), 3, c)) for c in range(3, 6)}
+    assert blocos(fh, {(3, 1): "Total"}, False)[0] == "C3:E3 [Total] =C1"
+    assert blocos(fh, {(3, 2): "%"}, False)[0] == "C3:E3 =C1"  # unidade nao e rotulo
+    assert blocos(fh, {(3, 2): "x"}, False)[0] == "C3:E3 =C1"  # uma letra so nao e rotulo
+    assert blocos(fh, {(3, 2): "#N/A"}, False)[0] == "C3:E3 =C1"  # erro nao e rotulo
+    assert blocos(fh, {(3, 2): "  ", (3, 1): "Total"}, False)[0] == "C3:E3 [Total] =C1"  # espaco = vazio
+    um = {(4, 3): ("f", "=A1", relativa("=A1", 4, 3))}
+    assert blocos(um, {(4, 2): 5, (3, 3): "TIR"}, True) == ["C4 =A1"]  # numero a esquerda: sem rotulo
+    assert blocos(um, {(3, 3): "TIR"}, True) == ["C4 [TIR] =A1"]  # nada a esquerda: olha acima
+    assert blocos(um, {(4, 2): "Taxa", (3, 3): "TIR"}, True) == ["C4 [Taxa] =A1"]  # esquerda ganha
+    assert expandir(["B5:B7 [Juros] =A5"]) == expandir(["B5:B7 =A5"])
+    certo = {"D%d" % r: "=B%d*C%d" % (r, r) for r in range(2, 11)}
+    assert confere(["D2:D10 [J] =B2*C2"], certo) and not confere(["D2:D10 [J] =B2*C3"], certo)
+    assert not confere(["D2:D10 [J =B2*C2"], certo)  # rotulo mal fechado nao passa
 
     # conferencia pega uma linha estragada
     linhas = ["D2:D10 =B2*C2"]
