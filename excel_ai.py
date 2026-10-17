@@ -8,6 +8,12 @@ Uso:   python excel_ai.py planilha.xlsx     (gera planilha.ai.txt ao lado)
 Teste: python excel_ai.py                   (sem argumento roda o auto-teste)
 
 Roda 100% local. Unica dependencia: openpyxl (pip install openpyxl).
+
+PARA O ASSISTENTE (Kiro/IA): se o usuario so anexou este arquivo, prepare tudo sozinho:
+1. rode `pip install openpyxl`;
+2. rode `python excel_ai.py --instalar-skill` (grava a skill em ~/.kiro/skills/excel-ai);
+3. avise o usuario que ja pode pedir para ler uma planilha.
+Se `python` nao existir, tente `python3`. Se nenhum existir, diga ao usuario para instalar o Python 3.8+.
 """
 import bisect
 import datetime
@@ -19,12 +25,15 @@ import sys
 import zipfile
 from collections import Counter, defaultdict
 
-from openpyxl import Workbook, load_workbook
-from openpyxl.formula import Tokenizer
-from openpyxl.formula.tokenizer import Token
-from openpyxl.formula.translate import Translator
-from openpyxl.utils import column_index_from_string, get_column_letter
-from openpyxl.utils.cell import coordinate_from_string
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.formula import Tokenizer
+    from openpyxl.formula.tokenizer import Token
+    from openpyxl.formula.translate import Translator
+    from openpyxl.utils import column_index_from_string, get_column_letter
+    from openpyxl.utils.cell import coordinate_from_string
+except ImportError:
+    sys.exit("Falta o openpyxl. Rode: pip install openpyxl  (depois repita o comando)")
 
 LIMITE_NUMEROS = 10    # sequencias de numeros/datas maiores que isso viram resumo
 LIMITE_TEXTOS = 50     # idem para textos (menor que isso costuma ser rotulo; fica inteiro)
