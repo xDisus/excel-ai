@@ -48,6 +48,14 @@ python excel_ai.py v7.3.xlsx v7.4.xlsx --diff
 
 Gera `v7.4.vs_v7.3.diff.ai.txt` só com o que mudou: abas novas ou removidas, fórmulas novas ou alteradas (com a fórmula antiga ao lado) e constantes alteradas. O que não mudou fica de fora. Se inserir linhas ou colunas, muita coisa aparece como mudança.
 
+Para converter todas as planilhas de uma pasta (sem entrar em subpastas):
+
+```
+python excel_ai.py minha_pasta
+```
+
+Cada `.xlsx`/`.xlsm` gera o seu `.ai.txt` ao lado. Se uma falhar, as outras seguem.
+
 Sem argumento, roda o auto-teste:
 
 ```
