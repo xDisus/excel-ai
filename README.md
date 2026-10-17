@@ -45,6 +45,8 @@ Se há links para outras planilhas (`=[1]Taxas!B2`), o final do arquivo ganha `#
 
 Se há conexões de dados (banco, web, arquivo de texto), `## Connections` lista cada uma: tipo, servidor/banco (ou URL/arquivo), comando e se atualiza ao abrir. Usuário, senha e chaves nunca aparecem: da string de conexão só ficam servidor, banco, provedor, driver e fonte de dados.
 
+Se há Power Query, `## Queries` mostra o nome, onde cada consulta carrega (tabela da aba, só conexão, modelo de dados) e o código M como está escrito (até 2000 caracteres por consulta). O código não é executado. Caminhos viram nome de arquivo e senhas/chaves são mascaradas, mas é melhor olhar o arquivo antes de compartilhar.
+
 Para olhar uma conta só (por exemplo a TIR final), passe a célula:
 
 ```

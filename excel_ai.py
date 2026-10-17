@@ -15,12 +15,14 @@ PARA O ASSISTENTE (Kiro/IA): se o usuario so anexou este arquivo, prepare tudo s
 3. avise o usuario que ja pode pedir para ler uma planilha.
 Se `python` nao existir, tente `python3`. Se nenhum existir, diga ao usuario para instalar o Python 3.8+.
 """
+import base64
 import bisect
 import datetime
 import io
 import os
 import re
 import shutil
+import struct
 import sys
 import zipfile
 from collections import Counter, defaultdict
@@ -46,6 +48,8 @@ LIMITE_FAIXAS = 50     # faixas por tipo de formato e aba
 LIMITE_PIVOTS = 50     # tabelas dinamicas por aba
 LIMITE_CONEXOES = 100  # conexoes de dados por livro
 LIMITE_COMANDO = 200   # caracteres do comando (SQL) de cada conexao
+LIMITE_CONSULTAS = 50  # consultas Power Query por livro
+LIMITE_M = 2000        # caracteres do codigo M de cada consulta
 AMOSTRA = 3            # quantos primeiros valores o resumo mostra
 RATIO_DUPLICADA = 0.8  # fracao de formulas iguais para tratar a aba como copia
 ERROS = ("#N/A", "#REF!", "#VALUE!", "#DIV/0!", "#NAME?", "#NUM!", "#NULL!", "#SPILL!", "#CALC!")
@@ -416,6 +420,7 @@ def tem_vba(fonte):
         return False
 
 
+MAX_REDIGIR = 10000  # caracteres que redigir() processa
 MAX_MEMBRO = 5 * 2 ** 20  # bytes lidos de um membro do zip (entrada nao confiavel)
 RE_URL = re.compile(r"(?!file:)[a-z][a-z0-9+.-]{1,10}://[^\s\"'<>]+", re.I)
 RE_URL_ARQUIVO = re.compile(r"file:/{2,3}(?:[^\s\"'<>|;]*/)*([^\s\"'<>|;/]*)", re.I)
@@ -439,6 +444,8 @@ def _url_limpa(m):
 def redigir(texto):
     """Tira de um texto o que identifica quem usa a planilha: so o nome do arquivo de cada caminho,
     URL sem query, fragmento e usuario, e valores depois de chaves como password/token. Redigir antes de truncar."""
+    if len(texto) > MAX_REDIGIR:  # regex com retrocesso: tempo cresce com o tamanho; quem chama trunca bem antes disso
+        texto = texto[:MAX_REDIGIR] + "...(cut)"
     t = RE_USERINFO.sub("", RE_URL.sub(_url_limpa, texto))
     t = RE_URL_ARQUIVO.sub(lambda m: unquote(m.group(1)), t)
     t = RE_CAMINHO_NIX.sub("", RE_CAMINHO_WIN.sub("", t))
@@ -533,6 +540,105 @@ def conexoes(fonte):
     if len(todas) > LIMITE_CONEXOES:
         linhas.append("(+%d more connections)" % (len(todas) - LIMITE_CONEXOES))
     return linhas, avisos
+
+
+RE_ITEM_XML = re.compile(r"^customXml/item\d+\.xml$")
+RE_SHARED = re.compile(r'^shared\s+(#"(?:[^"]|"")*"|[\w.]+)\s*=', re.M)
+
+
+def _blocos(blob):
+    """(pacote zip, metadados xml) do DataMashup; ValueError se o layout nao bate (MS-QDEFF)."""
+    def parte(pos):
+        (n,) = struct.unpack("<I", blob[pos:pos + 4])
+        if pos + 4 + n > len(blob):
+            raise ValueError("part larger than blob")
+        return blob[pos + 4:pos + 4 + n], pos + 4 + n
+    if struct.unpack("<I", blob[:4])[0] != 0:
+        raise ValueError("unknown DataMashup version")
+    pacote, pos = parte(4)
+    _, pos = parte(pos)  # permissoes
+    meta, _ = parte(pos)
+    return pacote, meta
+
+
+def _destinos(meta):
+    """{consulta: texto} de onde cada consulta carrega, lido dos metadados. Sem palpite: falha vira {}."""
+    try:
+        raiz = xml_seguro(meta[8:8 + struct.unpack("<I", meta[4:8])[0]])
+        destinos = {}
+        for item in raiz.iter():
+            if item.tag.rpartition("}")[2] != "Item":
+                continue
+            caminho = next((e.text or "" for e in item.iter() if e.tag.rpartition("}")[2] == "ItemPath"), "")
+            if not caminho.startswith("Section1/"):
+                continue
+            ent = {e.get("Type"): e.get("Value", "") for e in item.iter() if e.tag.rpartition("}")[2] == "Entry"}
+            if "FillEnabled" not in ent:
+                continue
+            partes = ["sheet table " + ent.get("FillTarget", "s?")[1:]] if ent["FillEnabled"] == "l1" else ["connection only"]
+            if "l1" in (ent.get("LoadedToAnalysisServices"), ent.get("FillToDataModelEnabled")):
+                partes.append("data model")
+            destinos[unquote(caminho[len("Section1/"):])] = ", ".join(partes)
+        return destinos
+    except Exception:
+        return {}
+
+
+def consultas(fonte):
+    """([(nome, codigo M, destino)], legivel). ([], True) se nao ha Power Query; legivel False se ha mas nao deu para ler.
+    Nunca executa nada: so desempacota base64, o zip interno e Section1.m."""
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    try:
+        with zipfile.ZipFile(fonte) as z:
+            for nome in sorted(n for n in z.namelist() if RE_ITEM_XML.match(n)):
+                try:
+                    bruto = ler_membro(z, nome)
+                except Exception:  # grande demais, cifrado, compressao estranha: nao da para saber se e DataMashup
+                    continue
+                if b"DataMashup" not in bruto.replace(b"\x00", b""):
+                    continue
+                try:
+                    raiz = xml_seguro(bruto)
+                    if raiz.tag.rpartition("}")[2] != "DataMashup":
+                        continue
+                    pacote, meta = _blocos(base64.b64decode("".join((raiz.text or "").split())))
+                    with zipfile.ZipFile(io.BytesIO(pacote)) as zi:
+                        m = ler_membro(zi, "Formulas/Section1.m")
+                    m = m.decode("utf-16" if m[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig", "replace")
+                except Exception:
+                    return [], False
+                destinos = _destinos(meta)
+                achadas = list(RE_SHARED.finditer(m))
+                lista = []
+                for i, a in enumerate(achadas):
+                    fim = achadas[i + 1].start() if i + 1 < len(achadas) else len(m)
+                    nome_q = a.group(1)
+                    nome_q = nome_q[2:-1].replace('""', '"') if nome_q.startswith('#"') else nome_q
+                    lista.append((nome_q, m[a.end():fim].strip().rstrip(";").strip(), destinos.get(nome_q, "")))
+                return lista, True
+    except zipfile.BadZipFile:
+        pass
+    except (ValueError, OSError):
+        return [], False
+    return [], True
+
+
+def secao_consultas(fonte):
+    """Linhas do ## Queries. O codigo M vai como escrito (redigido, depois truncado), recuado para nao virar cabecalho."""
+    lista, legivel = consultas(fonte)
+    if not legivel:
+        return ["Queries present but unreadable"]
+    linhas = []
+    for nome, codigo, destino in lista[:LIMITE_CONSULTAS]:
+        linhas.append("- %s%s" % (" ".join(redigir(nome).split()), ", loads to: " + destino if destino else ""))
+        codigo = redigir(codigo)
+        if len(codigo) > LIMITE_M:
+            codigo = codigo[:LIMITE_M] + "...(truncated)"
+        linhas += ["    " + l for l in codigo.splitlines()]
+    if len(lista) > LIMITE_CONSULTAS:
+        linhas.append("(+%d more queries)" % (len(lista) - LIMITE_CONSULTAS))
+    return linhas
 
 
 def links_externos(wb, textos):
@@ -999,6 +1105,9 @@ def converter(fonte, alvo=None):
         corpo += bloco
 
     if cadeia is None:
+        queries = secao_consultas(fonte)
+        if queries:
+            secoes_livro["Queries"] = ["## Queries"] + queries
         con, avisos_con = conexoes(fonte)
         if con or avisos_con:
             secoes_livro["Connections"] = ["## Connections"] + con if con else []
@@ -1037,6 +1146,8 @@ def converter(fonte, alvo=None):
         cabeca.append("'## Pivots' lists pivot tables: where each sits, what feeds it, and which fields are rows, columns, filters and values.")
     if "Connections" in secoes_livro:
         cabeca.append("'## Connections' (after the last sheet) lists data connections (database, web, text file): sheets fed by them hold loaded data that may be stale. Credentials are never shown.")
+    if "Queries" in secoes_livro:
+        cabeca.append("'## Queries' (after the last sheet) has the Power Query M code as written, never run; review it before sharing.")
     if "External links" in secoes_livro:
         cabeca.append("'## External links' (after the last sheet) maps each [N] in formulas to the workbook it points to; the linked file is never opened.")
     if cadeia is not None:
@@ -1372,6 +1483,7 @@ Read `references/format.md` for the full legend. Short version:
 - Per sheet `## Pivots` (only when present): each pivot table with where it sits, its source and its row, column, filter and value fields (`values: Soma de Valor = sum(Valor)`). The numbers it produced are ordinary cells in `## Data`; this section says they are a summary of the source. A warning appears when it refreshes on open.
 - After the last sheet, `# Workbook` holds workbook-level sections (only when present). `## External links`: `[1] taxas.xlsx, sheets: T, 3 formulas` says `[1]` in formulas (`=[1]T!B2`) is that file, shown by name only (no folder), with the cached sheet names and how many formulas use it. The linked file is never opened. Warnings flag links without saved values and links to URLs.
 - `## Connections` (in `# Workbook`, when present): one line per data connection: `'Name' (ODBC), source Server=db;Database=x, command SELECT ..., refreshes on open`. Sheets fed by a connection hold loaded data, not typed inputs; it may be stale. Only server/database/provider/driver/data-source parts of the connection string are kept, paths reduced to file names, URLs without query. Credentials never appear in the connection string; the `command` text is free text, redacted best-effort. A Power Query connection shows as `Power Query: Name`.
+- `## Queries` (in `# Workbook`, when present): each Power Query by name, where it loads (`loads to: sheet table X`, `connection only`, `data model`) and its M code, indented, as written (2000 characters max, 50 queries). The code is not run or interpreted: read `Source = ...` to see where data comes from. Paths are reduced to file names, URLs lose their query, values after password/token keys are masked, best-effort. `Queries present but unreadable` means the file has Power Query this tool could not unpack.
 
 Reason about the logic from the formulas: say what each block computes, which sheets feed it, and where inputs live. Use cached values `(v ...)` only as sanity checks; they may be stale.
 
@@ -1474,6 +1586,12 @@ One block per pivot table, after `## Notes`. `source` is a sheet range, `table o
 # Workbook
 ## Connections
 'Vendas' (ODBC), source Driver={SQL Server};Server=db;Database=x, command SELECT ..., refreshes on open
+## Queries
+- Vendas, loads to: sheet table Vendas
+    let
+        Source = Excel.Workbook(File.Contents("dados.xlsx"))
+    in
+        Source
 ## External links
 [1] taxas.xlsx, sheets: T, 3 formulas
 ```
@@ -1488,6 +1606,7 @@ Emitted once, after the last sheet, in this order when present: Connections, Que
 - `N data-table (what-if) cells`.
 - `File has VBA macros`.
 - `connection 'X' refreshes when the file opens`.
+- `Queries present but unreadable` (Power Query exists, could not be unpacked).
 - `external link [N] has no saved values` / `points to a URL`.
 - `pivot 'X' refreshes when the file opens` its numbers may differ from the saved ones.
 - `No calculated values saved in the file`.
@@ -1972,7 +2091,8 @@ def autoteste():
     assert redigir("PWD=pa ss;Server=db") == "PWD=***;Server=db"
     import time
     t0 = time.time()
-    redigir("a" * 200000)
+    for lixo in ("a" * 200000, "\\" * 3000000, "/" * 3000000, "a:" * 1000000):
+        redigir(lixo)
     assert time.time() - t0 < 5, "redigir quadratico"
     assert redigir("//u9:p9@h/x") == "//h/x" and redigir("Data Source=u9:p9@host") == "Data Source=host"
     assert redigir("a@corp.com") == "***@***"
@@ -2048,6 +2168,50 @@ def autoteste():
     assert "skipped" in conexoes(_injetar(_fixture(), {"xl/connections.xml": b"<a>"}))[1][0]
     assert "type unknown" in conexoes(_injetar(_fixture(), {"xl/connections.xml": b'<connections><connection id="1" name="a" type="\xc2\xb2"/></connections>'}))[0][0]
     assert conexoes(_fixture()) == ([], []) and conexoes(io.BytesIO(b"nao e zip")) == ([], [])
+    # power query: blob sintetico (base64 -> cabecalho -> zip interno -> Section1.m + metadados)
+    def _mashup(m_texto, meta_xml, codif="utf-8-sig"):
+        bz = io.BytesIO()
+        with zipfile.ZipFile(bz, "w") as zq:
+            zq.writestr("Formulas/Section1.m", m_texto.encode(codif))
+        pacote = bz.getvalue()
+        xml = meta_xml.encode("utf-8")
+        meta = struct.pack("<II", 0, len(xml)) + xml + struct.pack("<I", 0)
+        blob = struct.pack("<II", 0, len(pacote)) + pacote + struct.pack("<I", 0) + struct.pack("<I", len(meta)) + meta + struct.pack("<I", 0)
+        b64 = base64.b64encode(blob).decode()
+        b64 = b64[:20] + "\n  " + b64[20:]  # espaco em branco dentro do base64
+        return ('<DataMashup xmlns="http://schemas.microsoft.com/DataMashup">%s</DataMashup>' % b64).encode("utf-16")
+    m_txt = ('section Section1;\r\n\r\nshared Vendas = let\r\n    Source = Excel.Workbook(File.Contents("C:\\Users\\ana\\x.xlsx")),\r\n'
+             '    Web = Web.Contents("https://h.com/p?sig=zzz9", [Headers=[Authorization="Bearer abc9"]]),\r\n    Conn = [Password = "hunter2"]\r\nin\r\n    Source;\r\n\r\n'
+             'shared #"Vendas 2024" = let\r\n    S = Vendas\r\nin\r\n    S;\r\n')
+    meta_x = ('<LocalPackageMetadataFile><Items><Item><ItemLocation><ItemType>Formula</ItemType><ItemPath>Section1/Vendas</ItemPath></ItemLocation>'
+              '<StableEntries><Entry Type="FillEnabled" Value="l1"/><Entry Type="FillTarget" Value="sVendas"/><Entry Type="FillToDataModelEnabled" Value="l1"/></StableEntries></Item>'
+              '<Item><ItemLocation><ItemType>Formula</ItemType><ItemPath>Section1/Vendas%202024</ItemPath></ItemLocation>'
+              '<StableEntries><Entry Type="FillEnabled" Value="l0"/></StableEntries></Item></Items></LocalPackageMetadataFile>')
+    cm = _injetar(_fixture(), {"customXml/item1.xml": _mashup(m_txt, meta_x)})
+    lista, ok = consultas(cm)
+    assert ok and [q[0] for q in lista] == ["Vendas", "Vendas 2024"] and lista[1][1].startswith("let") and lista[1][1].endswith("S"), lista
+    assert [q[2] for q in lista] == ["sheet table Vendas, data model", "connection only"]
+    txt, _ = converter(cm)
+    qs = txt.split("\n# Workbook\n")[1]
+    assert qs.startswith("## Queries\n- Vendas, loads to: sheet table Vendas, data model\n    let\n        Source = Excel.Workbook(File.Contents(\"x.xlsx\")),\n"), qs
+    assert "- Vendas 2024, loads to: connection only\n    let\n        S = Vendas\n    in\n        S" in qs
+    assert "https://h.com/p" in qs and "Password=***" in qs and "Authorization=***" in qs
+    assert not any(k in txt for k in ("ana", "zzz9", "abc9", "hunter2", "Users")), txt
+    assert "'## Queries' (after the last sheet)" in txt and "# Workbook" not in converter(cm, "Fluxo!D5")[0]
+    # truncamento, limite, destino ausente, sem Power Query, blob quebrado
+    longo = _injetar(_fixture(), {"customXml/item1.xml": _mashup("section Section1;\nshared Q = " + "x" * 5000 + ";", "<a/>")})
+    sq = secao_consultas(longo)
+    assert sq[0] == "- Q" and sq[1] == "    " + "x" * LIMITE_M + "...(truncated)", sq
+    muitas = "section Section1;\n" + "".join("shared Q%d = 1;\n" % i for i in range(60))
+    assert secao_consultas(_injetar(_fixture(), {"customXml/item1.xml": _mashup(muitas, "<a/>")}))[-1] == "(+10 more queries)"
+    assert consultas(_injetar(_fixture(), {"customXml/item1.xml": _mashup("section Section1;", "<a/>")})) == ([], True)
+    assert consultas(_fixture()) == ([], True) and consultas(io.BytesIO(b"nao zip")) == ([], True)
+    assert consultas(_injetar(_fixture(), {"customXml/item1.xml": b""})) == ([], True)
+    assert consultas(_injetar(_fixture(), {"customXml/item1.xml": b"<a>" + b" " * (6 * 2 ** 20) + b"</a>"})) == ([], True)
+    for ruim in (b'<DataMashup xmlns="http://schemas.microsoft.com/DataMashup">AAAA</DataMashup>', b'<DataMashup>!!nao-base64</DataMashup>',
+                 b'<!DOCTYPE DataMashup [<!ENTITY e "x">]><DataMashup>&e;</DataMashup>'):
+        assert secao_consultas(_injetar(_fixture(), {"customXml/item1.xml": ruim})) == ["Queries present but unreadable"]
+    assert "## Queries" not in converter(_injetar(_fixture(), {"customXml/item1.xml": b"<outra/>"}))[0]
     print("auto-teste ok")
 
 
