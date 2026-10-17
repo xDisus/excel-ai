@@ -40,6 +40,14 @@ python excel_ai.py sua_planilha.xlsx --celula "Resumo!B5"
 
 Gera `sua_planilha.Resumo_B5.ai.txt` só com as fórmulas e entradas de que essa célula depende, em todas as abas.
 
+Para ver o que mudou entre duas versões (por exemplo v7.3 e v7.4), passe as duas e `--diff`:
+
+```
+python excel_ai.py v7.3.xlsx v7.4.xlsx --diff
+```
+
+Gera `v7.4.vs_v7.3.diff.ai.txt` só com o que mudou: abas novas ou removidas, fórmulas novas ou alteradas (com a fórmula antiga ao lado) e constantes alteradas. O que não mudou fica de fora. Se inserir linhas ou colunas, muita coisa aparece como mudança.
+
 Sem argumento, roda o auto-teste:
 
 ```

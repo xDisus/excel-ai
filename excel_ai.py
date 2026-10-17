@@ -2,6 +2,7 @@
 
 Uso:   python excel_ai.py planilha.xlsx     (gera planilha.ai.txt ao lado)
        python excel_ai.py planilha.xlsx --celula "Aba!B5"   (so o que essa celula usa)
+       python excel_ai.py antiga.xlsx nova.xlsx --diff      (so o que mudou entre as duas)
 Teste: python excel_ai.py                   (sem argumento roda o auto-teste)
 
 Roda 100% local. Unica dependencia: openpyxl (pip install openpyxl).
@@ -583,23 +584,9 @@ def precedentes(wb, dados, alvo):
     return cadeia, linhas, usados
 
 
-def converter(fonte, alvo=None):
-    """Retorna (texto, numeros). fonte = caminho ou arquivo aberto.
-    alvo = "Aba!B5": so a cadeia de precedentes dessa celula."""
-    if hasattr(fonte, "seek"):
-        fonte.seek(0)
-    wb = load_workbook(fonte)
-    if hasattr(fonte, "seek"):
-        fonte.seek(0)
-    wb_v = load_workbook(fonte, read_only=True, data_only=True)
-
-    avisos, mapa, corpo = [], [], []
-    bruto_chars = 0  # tamanho do dump celula a celula (so para a comparacao)
-    falhas, total_formulas, sem_cache = [], 0, True
-    ja_vistas = []  # (nome, esperado) das abas anteriores
-    s_form = s_dados = 0
-    abas = []
-
+def ler_abas(wb, wb_v):
+    """[(aba, formulas, valores, cache)], tamanho do dump celula a celula, True se nenhuma formula tem valor salvo."""
+    abas, bruto_chars, sem_cache = [], 0, True
     for ws in wb.worksheets:
         cache = {}
         for linha in wb_v[ws.title].iter_rows():
@@ -625,6 +612,26 @@ def converter(fonte, alvo=None):
         if any(pos in cache for pos in formulas):
             sem_cache = False
         abas.append((ws, formulas, valores, cache))
+
+    return abas, bruto_chars, sem_cache
+
+
+def converter(fonte, alvo=None):
+    """Retorna (texto, numeros). fonte = caminho ou arquivo aberto.
+    alvo = "Aba!B5": so a cadeia de precedentes dessa celula."""
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    wb = load_workbook(fonte)
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    wb_v = load_workbook(fonte, read_only=True, data_only=True)
+
+    avisos, mapa, corpo = [], [], []
+    falhas, total_formulas = [], 0
+    ja_vistas = []  # (nome, esperado) das abas anteriores
+    s_form = s_dados = 0
+
+    abas, bruto_chars, sem_cache = ler_abas(wb, wb_v)
 
     cadeia, contexto, todas = None, None, 0
     if alvo is not None:
@@ -755,6 +762,138 @@ def converter(fonte, alvo=None):
         "falhas": len(falhas),
     }
     return texto, numeros
+
+
+LIMITE_CONSTANTES = 200  # linhas de constantes por aba no --diff
+
+
+def _igual(a, b):
+    """Mesmo valor (ruido de ponto flutuante abaixo de 1e-9 nao conta)."""
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) and not isinstance(b, bool):
+        return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
+    return fmt(a) == fmt(b)
+
+
+def _abrir(fonte):
+    """(wb, abas) de uma planilha, para o --diff."""
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    wb = load_workbook(fonte)
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    wb_v = load_workbook(fonte, read_only=True, data_only=True)
+    abas = ler_abas(wb, wb_v)[0]
+    wb_v.close()
+    return wb, {ws.title: (formulas, valores, cache) for ws, formulas, valores, cache in abas}
+
+
+def _secao_diff(titulo, formulas, contexto, cache, falhas, aba):
+    """Bloco compacto de um conjunto de formulas, com a conferencia de sempre."""
+    if not formulas:
+        return []
+    linhas = secao_formulas(formulas, {}, "unchanged", contexto, cache)
+    if not confere(linhas, esperado(formulas)):
+        falhas.append("%s (%s)" % (aba, titulo))
+        linhas = por_celula(formulas)
+    return ["## " + titulo] + linhas
+
+
+def converter_diff(antiga, nova):
+    """Retorna (texto, numeros): so o que mudou da planilha antiga para a nova."""
+    wb_a, abas_a = _abrir(antiga)
+    wb_n, abas_n = _abrir(nova)
+    falhas, corpo, resumo = [], [], []
+    n_mudou = n_antes = n_const = n_iguais = 0
+    vazio = ({}, {}, {})
+
+    for nome in list(abas_n) + [t for t in abas_a if t not in abas_n]:
+        if nome not in abas_a or nome not in abas_n:
+            fs = (abas_n if nome in abas_n else abas_a)[nome][0]
+            qtd = sum(1 for f in fs.values() if f[0] in "fa")
+            resumo.append("- sheet '%s' %s (%d formulas)" % (nome, "added" if nome in abas_n else "removed", qtd))
+            continue
+        fa, va, ca = abas_a[nome]
+        fn, vn, cn = abas_n[nome]
+        ea, en = esperado(fa), esperado(fn)
+        mudou = {pos: f for pos, f in fn.items() if f[0] in "fa" and ea.get(ref(*pos)) != en[ref(*pos)]}
+        antes = {pos: f for pos, f in fa.items() if f[0] in "fa" and en.get(ref(*pos)) != ea[ref(*pos)]}
+        const = []
+        va = {q: x for q, x in va.items() if not (isinstance(x, str) and not x.strip())}  # "" = vazio
+        vn = {q: x for q, x in vn.items() if not (isinstance(x, str) and not x.strip())}
+        for pos in sorted(set(va) | set(vn)):
+            a, n = va.get(pos), vn.get(pos)
+            if pos in va and pos in vn:
+                if not _igual(a, n):
+                    const.append("%s %s -> %s" % (ref(*pos), fmt(a), fmt(n)))
+            elif pos in vn:
+                const.append("%s added %s" % (ref(*pos), fmt(n)))
+            else:
+                const.append("%s removed (was %s)" % (ref(*pos), fmt(a)))
+        if not (mudou or antes or const):
+            n_iguais += 1
+            continue
+        n_mudou += len(mudou)
+        n_antes += len(antes)
+        n_const += len(const)
+        bloco = ["", "# Sheet '%s'" % nome]
+        bloco += _secao_diff("Formulas new or changed", mudou, (fn, vn), cn, falhas, nome)
+        bloco += _secao_diff("Formulas before (changed or removed cells)", antes, (fa, va), ca, falhas, nome)
+        if const:
+            extra = len(const) - LIMITE_CONSTANTES
+            bloco += ["## Constants"] + const[:LIMITE_CONSTANTES] + (["... %d more" % extra] if extra > 0 else [])
+        corpo += bloco
+
+    nomes_a = dict(n.split(" = ", 1) for n in nomes_definidos(wb_a))
+    nomes_n = dict(n.split(" = ", 1) for n in nomes_definidos(wb_n))
+    nomes = (["%s added = %s" % (k, nomes_n[k]) for k in nomes_n if k not in nomes_a]
+             + ["%s removed (was %s)" % (k, nomes_a[k]) for k in nomes_a if k not in nomes_n]
+             + ["%s changed: %s -> %s" % (k, nomes_a[k], nomes_n[k]) for k in nomes_n if k in nomes_a and nomes_a[k] != nomes_n[k]])
+
+    cabeca = [
+        "# excel_ai diff (old -> new)",
+        "Only what changed. '## Formulas new or changed' is the NEW version, same format as the normal dump",
+        "('<range> [label] (v value) <formula>', 'except' = cell inside the range that did not change).",
+        "'## Formulas before' is the OLD formula of the cells that changed or disappeared.",
+        "'A1 old -> new' is a constant that changed.",
+        "Summary: %d formulas new or changed, %d old formulas replaced or removed, %d constants changed, %d sheet(s) without changes."
+        % (n_mudou, n_antes, n_const, n_iguais),
+    ]
+    if falhas:
+        cabeca.append("WARNING: compact view failed the self-check in: %s. Those parts list one formula per cell." % ", ".join(falhas))
+    if resumo:
+        cabeca += ["", "## Sheets"] + resumo
+    if nomes:
+        cabeca += ["", "## Defined names"] + nomes
+    if not (corpo or resumo or nomes):
+        cabeca.append("No changes found.")
+    texto = "\n".join(cabeca + corpo) + "\n"
+    return texto, {"novo": tokens(texto), "formulas": n_mudou, "antes": n_antes, "constantes": n_const,
+                   "falhas": len(falhas)}
+
+
+def main_diff(antiga, nova):
+    for caminho in (antiga, nova):
+        if not os.path.isfile(caminho):
+            sys.stderr.write("erro: arquivo nao encontrado: %s\n" % ascii(caminho))
+            return 2
+    try:
+        texto, n = converter_diff(antiga, nova)
+    except Exception as e:
+        sys.stderr.write("erro: nao consegui ler a planilha (%s: %s)\n" % (type(e).__name__, ascii(str(e))))
+        return 2
+    limpo = lambda c: re.sub(r"[^A-Za-z0-9]", "_", os.path.splitext(os.path.basename(c))[0])
+    destino = os.path.join(os.path.dirname(os.path.abspath(nova)), "%s.vs_%s.diff.ai.txt" % (limpo(nova), limpo(antiga)))
+    with io.open(destino, "w", encoding="utf-8", newline="\n") as arq:
+        arq.write(texto)
+    print("Tokens do diff:  %10s" % "{:,}".format(n["novo"]))
+    print("Formulas novas/mudadas: %s | antigas trocadas/removidas: %s | constantes: %s" % (
+        n["formulas"], n["antes"], n["constantes"]))
+    if n["falhas"]:
+        print("Conferencia das formulas: FALHOU em %d parte(s); elas sairam celula a celula." % n["falhas"])
+    else:
+        print("Conferencia das formulas: 100%%")
+    print("Arquivo gerado: %s" % os.path.basename(destino).encode("ascii", "backslashreplace").decode())
+    return 1 if n["falhas"] else 0
 
 
 def main(caminho, alvo=None):
@@ -1087,6 +1226,93 @@ def autoteste():
         assert os.path.isfile(os.path.join(pasta, "fix.Fluxo_D5.ai.txt"))
         assert main(caminho, "Nada!A1") == 2
 
+    # --diff: duas versoes
+    from openpyxl.workbook.defined_name import DefinedName as DN
+
+    def livro(edita=None):
+        w = Workbook()
+        a = w.active
+        a.title = "S"
+        a["A1"], a["B1"] = "Item", "Valor"
+        for r in range(2, 12):
+            a["A%d" % r] = "x%d" % r
+            a["B%d" % r] = r
+            a["C%d" % r] = "=B%d*2" % r
+        a["D1"] = "=SUM(C2:C11)"
+        w.create_sheet("T")["A1"] = "=S!D1"
+        w.defined_names["Taxa"] = DN("Taxa", attr_text="S!$B$2")
+        if edita:
+            edita(w)
+        b = io.BytesIO()
+        w.save(b)
+        return b
+
+    velho = livro()
+    texto, n = converter_diff(velho, livro())
+    assert "No changes found." in texto and n["formulas"] == n["antes"] == n["constantes"] == 0 and n["falhas"] == 0, texto
+
+    def v2(w):
+        a = w["S"]
+        for r in range(5, 9):
+            a["C%d" % r] = "=B%d*3" % r  # bloco de 4 mudou
+        a["C11"] = 7  # formula virou constante
+        a["B2"] = 99  # constante mudou
+        a["E1"] = "novo"  # constante nova
+        a["A3"] = None  # constante removida
+        w["T"]["A1"] = "=S!D1+1"
+        w.create_sheet("U")["A1"] = "=1+1"
+        del w["S"].parent.defined_names["Taxa"]
+        w.defined_names["Outra"] = DN("Outra", attr_text="S!$B$3")
+
+    texto, n = converter_diff(velho, livro(v2))
+    assert n["falhas"] == 0, texto
+    assert "C5:C8 =B5*3" in texto and "C5:C8 =B5*2" in texto, texto  # novo e antigo
+    assert "C11 =B11*2" in texto and "C11 7" not in texto.split("## Constants")[0]
+    assert "B2 2 -> 99" in texto and "E1 added novo" in texto and "A3 removed (was x3)" in texto and "C11 added 7" in texto, texto
+    assert "A1 =S!D1+1" in texto and "A1 =S!D1\n" in texto
+    assert "- sheet 'U' added (1 formulas)" in texto
+    assert "Taxa removed (was S!$B$2)" in texto and "Outra added = S!$B$3" in texto, texto
+    assert "C2:C4" not in texto and "SUM" not in texto  # o que nao mudou fica de fora
+    assert n["formulas"] == 5 and n["antes"] == 6 and n["constantes"] == 4, n
+    # preencher para baixo igual nao e mudanca (mesma formula relativa)
+    texto, n = converter_diff(velho, livro(lambda w: w["S"].__setitem__("C2", "=B2*2")))
+    assert "No changes found." in texto
+    # ruido: "" vira vazio, float em 1e-12 nao conta
+    def ruido(w):
+        w["S"]["F1"] = ""
+        w["S"]["B3"] = 3.0000000000001
+    texto, n = converter_diff(velho, livro(ruido))
+    assert "No changes found." in texto, texto
+    # mais de 200 constantes: corta
+    def muitas(w):
+        for r in range(1, 301):
+            w["T"]["B%d" % r] = r
+    texto, n = converter_diff(velho, livro(muitas))
+    assert "... 100 more" in texto and texto.count("added") == 200 and n["constantes"] == 300
+    # conferencia que falha cai para uma linha por celula
+    guarda = confere
+    globals()["confere"] = lambda linhas, meu, base=None: False
+    try:
+        texto, n = converter_diff(velho, livro(v2))
+    finally:
+        globals()["confere"] = guarda
+    assert n["falhas"] > 0 and "WARNING: compact view failed" in texto and "C5 =B5*3" in texto, texto
+    # CLI
+    pa, pn = os.path.join(pasta, "old v1.xlsx"), os.path.join(pasta, "new v2.xlsx")
+    for caminho_x, b in ((pa, velho), (pn, livro(v2))):
+        with open(caminho_x, "wb") as arq:
+            arq.write(b.getvalue())
+    uso = subprocess.run([sys.executable, os.path.abspath(__file__), pa, pn, "--diff"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert uso.returncode == 0 and b"100%" in uso.stdout, uso.stdout + uso.stderr
+    assert os.path.isfile(os.path.join(pasta, "new_v2.vs_old_v1.diff.ai.txt"))
+    uso = subprocess.run([sys.executable, os.path.abspath(__file__), pa, os.path.join(pasta, "nada.xlsx"), "--diff"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert uso.returncode == 2
+    uso = subprocess.run([sys.executable, os.path.abspath(__file__), pa, pn, "--celula"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert uso.returncode == 2 and b"uso:" in uso.stderr
+
     # macro: zip com vbaProject.bin
     z = io.BytesIO()
     with zipfile.ZipFile(z, "w") as arq:
@@ -1098,9 +1324,11 @@ def autoteste():
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[2] == "--celula":
         sys.exit(main(sys.argv[1], sys.argv[3]))
+    if len(sys.argv) == 4 and sys.argv[3] == "--diff":
+        sys.exit(main_diff(sys.argv[1], sys.argv[2]))
     if len(sys.argv) == 2:
         sys.exit(main(sys.argv[1]))
     if len(sys.argv) > 1:
-        sys.stderr.write("uso: python excel_ai.py planilha.xlsx [--celula Aba!B5]\n")
+        sys.stderr.write("uso: python excel_ai.py planilha.xlsx [--celula Aba!B5]  |  python excel_ai.py antiga.xlsx nova.xlsx --diff\n")
         sys.exit(2)
     autoteste()
