@@ -3,6 +3,7 @@ title: "feat: Read data connections"
 type: feat
 date: 2026-10-17
 artifact_contract: ce-unified-plan/v1
+status: completed
 artifact_readiness: implementation-ready
 execution: code
 product_contract_source: ce-plan-bootstrap
@@ -117,3 +118,7 @@ R1 to R7 met, legend and README updated, auto-test green, existing fixture outpu
 - `redigir` é best-effort: valor sem aspas de `password=`/`key=` vai até `;`, `,`, `&` ou fim de linha; caminhos POSIX só em /home,/Users,/root,/mnt,/media,/var,/tmp,/opt. Nos testes, plante segredos reais (`hunter2`) e confira que sumiram E que o resto ficou.
 - Teste só com venv: `/tmp/claude-0/venv/bin/python excel_ai.py` (sem openpyxl no sistema). Mantenha o fonte em ASCII e compatível com Python 3.8.
 - Verificação R5: compare `converter()` de fixture, `--celula` e `--diff` contra a saída da `main` antes do plano.
+
+## Resultado da execução
+
+Entregue no PR #16 (base: feat/external-links, depende de #14 e #15). Revisão: `type` com dígito Unicode (crash) e userinfo sem esquema (`u:p@h`) corrigidos em `redigir`/`conexoes`. P2 aberto: o texto de `command` é livre; literais SQL com segredo passam (documentado na legenda). Validação em planilha real: pendente.

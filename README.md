@@ -43,6 +43,8 @@ Se a planilha tem tabelas dinâmicas, o arquivo ganha uma seção `## Pivots` po
 
 Se há links para outras planilhas (`=[1]Taxas!B2`), o final do arquivo ganha `# Workbook` / `## External links`: `[1] taxas.xlsx, sheets: T, 3 formulas`. Só o nome do arquivo aparece, nunca a pasta; o arquivo ligado não é aberto.
 
+Se há conexões de dados (banco, web, arquivo de texto), `## Connections` lista cada uma: tipo, servidor/banco (ou URL/arquivo), comando e se atualiza ao abrir. Usuário, senha e chaves nunca aparecem: da string de conexão só ficam servidor, banco, provedor, driver e fonte de dados.
+
 Para olhar uma conta só (por exemplo a TIR final), passe a célula:
 
 ```

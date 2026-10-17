@@ -44,6 +44,8 @@ LIMITE_NOTA = 200      # caracteres de cada nota (comentario de celula)
 LIMITE_NOTAS = 100     # notas por aba
 LIMITE_FAIXAS = 50     # faixas por tipo de formato e aba
 LIMITE_PIVOTS = 50     # tabelas dinamicas por aba
+LIMITE_CONEXOES = 100  # conexoes de dados por livro
+LIMITE_COMANDO = 200   # caracteres do comando (SQL) de cada conexao
 AMOSTRA = 3            # quantos primeiros valores o resumo mostra
 RATIO_DUPLICADA = 0.8  # fracao de formulas iguais para tratar a aba como copia
 ERROS = ("#N/A", "#REF!", "#VALUE!", "#DIV/0!", "#NAME?", "#NUM!", "#NULL!", "#SPILL!", "#CALC!")
@@ -422,6 +424,7 @@ RE_CAMINHO_NIX = re.compile(r"(?<![\w:/.])/(?:home|Users|root|mnt|media|var|tmp|
 RE_BEARER = re.compile(r"\b(bearer|basic)\s+[^\s\"',;)\]]+", re.I)
 RE_SEGREDO = re.compile(r"(\b\w{0,40}(?:password|pwd|key|token|secret|authorization)\b)\s*[=:]\s*"
                         r"(?:\"[^\"]*\"|'[^']*'|[^;,&\"')\]\r\n]+)", re.I)
+RE_USERINFO = re.compile(r"(?<![\w.])[^\s/:@;\"'=]+:[^\s/@;\"']+@")  # user:senha@ sem esquema
 RE_EMAIL = re.compile(r"[\w.+-]{1,64}@[\w-]+(?:\.[\w-]+)+")
 
 
@@ -436,7 +439,7 @@ def _url_limpa(m):
 def redigir(texto):
     """Tira de um texto o que identifica quem usa a planilha: so o nome do arquivo de cada caminho,
     URL sem query, fragmento e usuario, e valores depois de chaves como password/token. Redigir antes de truncar."""
-    t = RE_URL.sub(_url_limpa, texto)
+    t = RE_USERINFO.sub("", RE_URL.sub(_url_limpa, texto))
     t = RE_URL_ARQUIVO.sub(lambda m: unquote(m.group(1)), t)
     t = RE_CAMINHO_NIX.sub("", RE_CAMINHO_WIN.sub("", t))
     t = RE_SEGREDO.sub(lambda m: m.group(1) + "=***", RE_BEARER.sub(lambda m: m.group(1) + " ***", t))
@@ -481,6 +484,55 @@ def bloco_livro(secoes):
     """Bloco '# Workbook' com as secoes do livro todo ({nome: linhas}, na ordem ORDEM_LIVRO); vazio se nenhuma tem conteudo."""
     linhas = [l for k in ORDEM_LIVRO for l in secoes.get(k, [])]
     return ["", "# Workbook"] + linhas if linhas else []
+
+
+TIPO_CONEXAO = {1: "ODBC", 2: "DAO", 3: "web", 4: "text", 5: "OLE DB"}
+CHAVES_CONEXAO = ("data source", "initial catalog", "provider", "driver", "database", "server")
+
+
+def conexoes(fonte):
+    """(linhas, avisos) das conexoes de dados (xl/connections.xml). Nunca abre a conexao.
+    Da string de conexao so ficam as chaves de CHAVES_CONEXAO (lista permitida, nao lista de segredos)."""
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    try:
+        with zipfile.ZipFile(fonte) as z:
+            if "xl/connections.xml" not in z.namelist():
+                return [], []
+            raiz = xml_seguro(ler_membro(z, "xl/connections.xml"))
+    except zipfile.BadZipFile:
+        return [], []
+    except (ValueError, OSError) as e:
+        return [], ["- connections.xml skipped: %s" % redigir(" ".join(str(e).split()))[:100]]
+    una = lambda x: " ".join(redigir(str(x)).split())
+    todas = [c for c in raiz.iter() if c.tag.rpartition("}")[2] == "connection"]
+    linhas, avisos = [], []
+    for c in todas[:LIMITE_CONEXOES]:
+        filho = lambda tag: next((f for f in c if f.tag.rpartition("}")[2] == tag), None)
+        db, web, txt = filho("dbPr"), filho("webPr"), filho("textPr")
+        nome = una(c.get("name") or "id %s" % c.get("id", "?"))
+        cadeia = (db.get("connection") if db is not None else "") or ""
+        if "microsoft.mashup" in cadeia.lower():
+            linhas.append("- Power Query: %s" % nome)  # detalhes: ## Queries
+            continue
+        tipo = c.get("type", "")
+        partes = ["- '%s' (%s)" % (nome, TIPO_CONEXAO.get(int(tipo), "type %s" % tipo) if re.fullmatch(r"[0-9]+", tipo) else "type unknown")]
+        fonte_txt = ";".join(una(kv) for kv in cadeia.split(";") if kv.split("=")[0].strip().lower() in CHAVES_CONEXAO)
+        for dado in (fonte_txt, web is not None and web.get("url"), txt is not None and txt.get("sourceFile"), c.get("odcFile")):
+            if dado:
+                partes.append("source %s" % una(dado))
+        cmd = una(db.get("command") or "") if db is not None else ""
+        if cmd:
+            partes.append("command %s" % (cmd[:LIMITE_COMANDO] + "...(truncated)" if len(cmd) > LIMITE_COMANDO else cmd))
+        if c.get("refreshOnLoad") in ("1", "true"):
+            partes.append("refreshes on open")
+            avisos.append("- connection '%s' refreshes when the file opens: loaded data may differ from the saved values" % nome)
+        if c.get("background") in ("1", "true"):
+            partes.append("background refresh")
+        linhas.append(", ".join(partes))
+    if len(todas) > LIMITE_CONEXOES:
+        linhas.append("(+%d more connections)" % (len(todas) - LIMITE_CONEXOES))
+    return linhas, avisos
 
 
 def links_externos(wb, textos):
@@ -947,6 +999,10 @@ def converter(fonte, alvo=None):
         corpo += bloco
 
     if cadeia is None:
+        con, avisos_con = conexoes(fonte)
+        if con or avisos_con:
+            secoes_livro["Connections"] = ["## Connections"] + con if con else []
+            avisos += avisos_con
         links, avisos_links = links_externos(wb, todos_textos)
         if links:
             secoes_livro["External links"] = ["## External links"] + links
@@ -979,6 +1035,8 @@ def converter(fonte, alvo=None):
     ]
     if ha_pivots:
         cabeca.append("'## Pivots' lists pivot tables: where each sits, what feeds it, and which fields are rows, columns, filters and values.")
+    if "Connections" in secoes_livro:
+        cabeca.append("'## Connections' (after the last sheet) lists data connections (database, web, text file): sheets fed by them hold loaded data that may be stale. Credentials are never shown.")
     if "External links" in secoes_livro:
         cabeca.append("'## External links' (after the last sheet) maps each [N] in formulas to the workbook it points to; the linked file is never opened.")
     if cadeia is not None:
@@ -1313,6 +1371,7 @@ Read `references/format.md` for the full legend. Short version:
 - Per sheet `## Notes` (only when present): the author's cell comments, `B5 note: <text>` (200 characters max, 100 per sheet). Treat them as the author's own explanation of assumptions.
 - Per sheet `## Pivots` (only when present): each pivot table with where it sits, its source and its row, column, filter and value fields (`values: Soma de Valor = sum(Valor)`). The numbers it produced are ordinary cells in `## Data`; this section says they are a summary of the source. A warning appears when it refreshes on open.
 - After the last sheet, `# Workbook` holds workbook-level sections (only when present). `## External links`: `[1] taxas.xlsx, sheets: T, 3 formulas` says `[1]` in formulas (`=[1]T!B2`) is that file, shown by name only (no folder), with the cached sheet names and how many formulas use it. The linked file is never opened. Warnings flag links without saved values and links to URLs.
+- `## Connections` (in `# Workbook`, when present): one line per data connection: `'Name' (ODBC), source Server=db;Database=x, command SELECT ..., refreshes on open`. Sheets fed by a connection hold loaded data, not typed inputs; it may be stale. Only server/database/provider/driver/data-source parts of the connection string are kept, paths reduced to file names, URLs without query. Credentials never appear in the connection string; the `command` text is free text, redacted best-effort. A Power Query connection shows as `Power Query: Name`.
 
 Reason about the logic from the formulas: say what each block computes, which sheets feed it, and where inputs live. Use cached values `(v ...)` only as sanity checks; they may be stale.
 
@@ -1413,6 +1472,8 @@ One block per pivot table, after `## Notes`. `source` is a sheet range, `table o
 
 ```
 # Workbook
+## Connections
+'Vendas' (ODBC), source Driver={SQL Server};Server=db;Database=x, command SELECT ..., refreshes on open
 ## External links
 [1] taxas.xlsx, sheets: T, 3 formulas
 ```
@@ -1426,6 +1487,7 @@ Emitted once, after the last sheet, in this order when present: Connections, Que
 - `N formulas use OFFSET/INDIRECT` target decided at run time; not followable statically.
 - `N data-table (what-if) cells`.
 - `File has VBA macros`.
+- `connection 'X' refreshes when the file opens`.
 - `external link [N] has no saved values` / `points to a URL`.
 - `pivot 'X' refreshes when the file opens` its numbers may differ from the saved ones.
 - `No calculated values saved in the file`.
@@ -1912,6 +1974,8 @@ def autoteste():
     t0 = time.time()
     redigir("a" * 200000)
     assert time.time() - t0 < 5, "redigir quadratico"
+    assert redigir("//u9:p9@h/x") == "//h/x" and redigir("Data Source=u9:p9@host") == "Data Source=host"
+    assert redigir("a@corp.com") == "***@***"
     assert redigir("=SUM(A1:A3)") == "=SUM(A1:A3)"
     z = _injetar(_fixture(), {"xl/extra.bin": b"zz"})
     assert zipfile.ZipFile(z).read("xl/extra.bin") == b"zz"
@@ -1960,6 +2024,30 @@ def autoteste():
     assert "# Workbook" not in converter(bio, "A!A1")[0]
     wbl._external_links[0].file_link = None  # destino ilegivel: sem excecao
     assert links_externos(wbl, [])[0][0].startswith("[1] unknown target")
+    # conexoes: lista permitida da string de conexao; segredos plantados nao saem, o resto fica
+    cx = (b'<?xml version="1.0"?><connections xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+          b'<connection id="1" name="Vendas" type="1" refreshOnLoad="1" background="1"><dbPr connection="Driver={SQL Server};Server=db;Database=x;UID=ana9;PWD=hunter2;ApiKey=abc9"'
+          b' command="SELECT a FROM t -- PWD=hunter4"/></connection>'
+          b'<connection id="2" name="Acc" type="5"><dbPr connection="Provider=Microsoft.ACE.OLEDB;Data Source=C:\\Users\\ana\\x.accdb;Extended Properties=hunter5"/></connection>'
+          b'<connection id="3" name="Site" type="4"><webPr url="https://h.com/p?token=zzz9"/></connection>'
+          b'<connection id="4" name="Arq" type="4"><textPr sourceFile="C:\\Users\\ana\\data.csv"/></connection>'
+          b'<connection id="5" name="Q1" type="5"><dbPr connection="Provider=Microsoft.Mashup.OleDb.1;Data Source=$Workbook$;Location=Q1"/></connection></connections>')
+    txt, _ = converter(_injetar(_fixture(), {"xl/connections.xml": cx}))
+    cons = txt.split("\n# Workbook\n")[1]
+    assert cons == ("## Connections\n"
+                    "- 'Vendas' (ODBC), source Driver={SQL Server};Server=db;Database=x, command SELECT a FROM t -- PWD=***, refreshes on open, background refresh\n"
+                    "- 'Acc' (OLE DB), source Provider=Microsoft.ACE.OLEDB;Data Source=x.accdb\n"
+                    "- 'Site' (text), source https://h.com/p\n- 'Arq' (text), source data.csv\n- Power Query: Q1\n"), cons
+    assert not any(k in txt for k in ("ana", "hunter", "abc9", "zzz9", "Users")), txt
+    assert "- connection 'Vendas' refreshes when the file opens" in txt and "'## Connections' (after the last sheet)" in txt
+    assert "# Workbook" not in converter(_injetar(_fixture(), {"xl/connections.xml": cx}), "Fluxo!D5")[0]
+    assert len(conexoes(_injetar(_fixture(), {"xl/connections.xml": cx.replace(b"</connections>", b'<connection id="9" name="n"/>' * 100 + b"</connections>")}))[0]) == 101
+    grande = b"<connections>" + b" " * (6 * 2 ** 20) + b"</connections>"
+    assert "skipped" in conexoes(_injetar(_fixture(), {"xl/connections.xml": grande}))[1][0]
+    assert "skipped" in conexoes(_injetar(_fixture(), {"xl/connections.xml": b'<!DOCTYPE a [<!ENTITY e "x">]><a/>'}))[1][0]
+    assert "skipped" in conexoes(_injetar(_fixture(), {"xl/connections.xml": b"<a>"}))[1][0]
+    assert "type unknown" in conexoes(_injetar(_fixture(), {"xl/connections.xml": b'<connections><connection id="1" name="a" type="\xc2\xb2"/></connections>'}))[0][0]
+    assert conexoes(_fixture()) == ([], []) and conexoes(io.BytesIO(b"nao e zip")) == ([], [])
     print("auto-teste ok")
 
 
