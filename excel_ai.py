@@ -35,7 +35,7 @@ PECA_LINHA = re.compile(r"^(\$?)(\d+)$")
 NOME_ABA = r"'((?:[^']|'')+)'|([^\W\d][\w.]*)"  # 'Aba com espaco' ou Aba
 RE_ABA = re.compile(r"(?<![#\w.\]])(?:%s)!" % NOME_ABA)
 RE_BLOCO = re.compile(r"^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))? (=.*)$")
-RE_MATRIZ = re.compile(r"^([A-Z]+\d+) array \S+ \{(=.*)\}$")
+RE_MATRIZ = re.compile(r"^([A-Z]+\d+) array (\S+) \{(=.*)\}$")
 RE_EXCECAO = re.compile(r"^  except ([A-Z]+\d+) (.*)$")
 RE_SUMIU = re.compile(r"^([A-Z]+\d+) no formula$")
 RE_REF_QUEBRADA = re.compile(r"(?:(?:%s)!)?#REF!" % NOME_ABA)
@@ -51,8 +51,8 @@ def ref(r, c):
 
 
 def limpa(formula):
-    """Tira prefixos internos do Excel: _xlfn.XLOOKUP vira XLOOKUP."""
-    return re.sub(r"_xlfn\.|_xlws\.|_xlpm\.", "", formula)
+    """Tira prefixos internos do Excel (_xlfn.XLOOKUP vira XLOOKUP) e quebras de linha (Alt+Enter)."""
+    return re.sub(r"[\r\n]+", " ", re.sub(r"_xlfn\.|_xlws\.|_xlpm\.", "", formula))
 
 
 def fmt(v):
@@ -198,7 +198,7 @@ def expandir(linhas, base=None):
             continue
         m = RE_MATRIZ.match(linha)
         if m:
-            out[m.group(1)] = m.group(2)
+            out[m.group(1)] = "{%s}%s" % (m.group(2), m.group(3))
             continue
         l1, n1, l2, n2, f = RE_BLOCO.match(linha).groups()
         origem = l1 + n1
@@ -226,7 +226,17 @@ def tradutor(f, origem):
 
 
 def esperado(formulas):
-    return {ref(r, c): limpa(f[1]) for (r, c), f in formulas.items() if f[0] in "fa"}
+    """{celula: formula como deve sair}; matriz leva a faixa junto, para a conferencia pegar faixa diferente."""
+    return {ref(r, c): ("{%s}%s" % (f[2], limpa(f[1])) if f[0] == "a" else limpa(f[1]))
+            for (r, c), f in formulas.items() if f[0] in "fa"}
+
+
+def confere(linhas, meu, base=None):
+    """True se as linhas expandem exatamente para as formulas originais."""
+    try:
+        return expandir(linhas, base) == meu
+    except Exception:  # linha que o leitor nao entende = conferencia falhou
+        return False
 
 
 def secao_formulas(formulas, valores, buraco="blank"):
@@ -434,7 +444,7 @@ def converter(fonte):
 
         # formulas
         linhas_f = secao_formulas(formulas, valores)
-        if expandir(linhas_f) != meu:
+        if not confere(linhas_f, meu):
             falhas.append(ws.title)
             linhas_f = por_celula(formulas)
         for base_nome, base in ja_vistas:
@@ -442,7 +452,7 @@ def converter(fonte):
             uniao = len(set(meu) | set(base))
             if uniao and iguais / float(uniao) >= RATIO_DUPLICADA:
                 dif = diferenca(formulas, meu, base_nome, base)
-                if len("\n".join(dif)) < len("\n".join(linhas_f)) and expandir(dif, base) == meu:
+                if len("\n".join(dif)) < len("\n".join(linhas_f)) and confere(dif, meu, base):
                     linhas_f = dif
                     break
         ja_vistas.append((ws.title, meu))
@@ -639,6 +649,50 @@ def autoteste():
     certo = {"D%d" % r: "=B%d*C%d" % (r, r) for r in range(2, 11)}
     assert expandir(linhas) == certo
     assert expandir(["D2:D10 =B2*C3"]) != certo
+    assert not confere(["linha que nao e formula"], certo)
+
+    # formula com quebra de linha (Alt+Enter) sai numa linha so e confere
+    wb = Workbook()
+    wb.active["A1"], wb.active["B1"] = 1, "=IF(A1>0,\n1,2)"
+    buf = io.BytesIO()
+    wb.save(buf)
+    texto, n = converter(buf)
+    assert "B1 =IF(A1>0, 1,2)" in texto and n["falhas"] == 0
+
+    # aba copiada com matriz de faixa diferente nao passa como igual
+    from openpyxl.worksheet.formula import ArrayFormula
+    wb = Workbook()
+    for nome, faixa in (("S1", "C1:C3"), ("S2", "C1:C2")):
+        ws = wb.create_sheet(nome)
+        for r in range(1, 30):
+            ws["A%d" % r] = "=B%d" % r
+        ws["C1"] = ArrayFormula(faixa, "=A1:A3*2")
+    buf = io.BytesIO()
+    wb.save(buf)
+    texto, n = converter(buf)
+    assert "C1 array C1:C2 {=A1:A3*2}" in texto.split("# Sheet 'S2'")[1] and n["falhas"] == 0
+
+    # plano B: se a conferencia falha, a aba sai celula a celula, com aviso, e main() sai com 1
+    import contextlib
+    import tempfile
+    pasta = tempfile.mkdtemp()
+    caminho = os.path.join(pasta, "fix.xlsx")
+    with open(caminho, "wb") as arq:
+        arq.write(_fixture().getvalue())
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert main(caminho) == 0 and os.path.isfile(os.path.join(pasta, "fix.ai.txt"))
+        original = globals()["expandir"]
+        globals()["expandir"] = lambda linhas, base=None: {}
+        try:
+            texto, n = converter(caminho)
+            assert main(caminho) == 1
+        finally:
+            globals()["expandir"] = original
+    # 3 abas com formulas (Fluxo, Meses, Fluxo B); abas sem formula nao tem o que conferir
+    assert n["falhas"] == 3 and "WARNING: compact view failed the self-check on 3 sheet(s)" in texto
+    assert "D3 =B3*C3" in texto  # uma linha por formula
+    with contextlib.redirect_stderr(io.StringIO()):
+        assert main(os.path.join(pasta, "nao_existe.xlsx")) == 2
     # Translator do openpyxl apagava ABA!#REF!; tradutor() protege
     assert tradutor("=XLOOKUP(A2,MIX!#REF!,'P 1'!#REF!)+#REF!", "B2")("B3") == "=XLOOKUP(A3,MIX!#REF!,'P 1'!#REF!)+#REF!"
 
