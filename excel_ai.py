@@ -694,7 +694,7 @@ def autoteste():
     with contextlib.redirect_stderr(io.StringIO()):
         assert main(os.path.join(pasta, "nao_existe.xlsx")) == 2
     # Translator do openpyxl apagava ABA!#REF!; tradutor() protege
-    assert tradutor("=XLOOKUP(A2,MIX!#REF!,'P 1'!#REF!)+#REF!", "B2")("B3") == "=XLOOKUP(A3,MIX!#REF!,'P 1'!#REF!)+#REF!"
+    assert tradutor("=XLOOKUP(A2,Base!#REF!,'P 1'!#REF!)+#REF!", "B2")("B3") == "=XLOOKUP(A3,Base!#REF!,'P 1'!#REF!)+#REF!"
 
     # macro: zip com vbaProject.bin
     z = io.BytesIO()
