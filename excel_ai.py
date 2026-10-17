@@ -620,10 +620,11 @@ def ler_abas(wb, wb_v):
 def converter(fonte, alvo=None):
     """Retorna (texto, numeros). fonte = caminho ou arquivo aberto.
     alvo = "Aba!B5": so a cadeia de precedentes dessa celula."""
-    seek = getattr(fonte, "seek", lambda _: None)
-    seek(0)
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
     wb = load_workbook(fonte)
-    seek(0)
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
     wb_v = load_workbook(fonte, read_only=True, data_only=True)
 
     avisos, mapa, corpo = [], [], []
@@ -776,10 +777,11 @@ def _igual(a, b):
 
 def _abrir(fonte):
     """(wb, abas) de uma planilha, para o --diff."""
-    seek = getattr(fonte, "seek", lambda _: None)
-    seek(0)
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
     wb = load_workbook(fonte)
-    seek(0)
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
     wb_v = load_workbook(fonte, read_only=True, data_only=True)
     abas = ler_abas(wb, wb_v)[0]
     wb_v.close()
