@@ -31,6 +31,14 @@ python excel_ai.py sua_planilha.xlsx
 Gera `sua_planilha.ai.txt` ao lado da planilha. É esse arquivo que você manda para a IA.
 Na tela aparecem só números: tokens antes e depois, e o resultado da conferência.
 
+Para olhar uma conta só (por exemplo a TIR final), passe a célula:
+
+```
+python excel_ai.py sua_planilha.xlsx --celula "Resumo!B5"
+```
+
+Gera `sua_planilha.Resumo_B5.ai.txt` só com as fórmulas e entradas de que essa célula depende, em todas as abas.
+
 Sem argumento, roda o auto-teste:
 
 ```
