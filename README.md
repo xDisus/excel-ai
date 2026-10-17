@@ -1,17 +1,37 @@
 # excel-ai
 
-Deixar planilhas Excel (calculadoras financeiras, fórmulas, PROCX entre abas) fáceis e baratas para IA ler.
+Transforma uma planilha Excel (calculadoras financeiras, PROCX entre abas, fluxos, TIR) em um texto compacto que uma IA lê rápido e entende.
 
-## Passo 1: medir se vale a pena
+- Fórmulas repetidas viram uma linha só (`E2:E361 =C2*G2`), com as exceções listadas.
+- Rótulos de texto ficam inteiros. Tabelas grandes de números viram resumo (faixa, mín, máx, primeiros valores).
+- Mapa das abas: quem usa quem, abas ocultas, tabelas, nomes definidos.
+- Avisos: `#REF!`, erros, `DESLOC`/`INDIRETO`, macros.
+- Conferência automática: o texto é expandido de volta e comparado com cada fórmula original. Se algo não bater, aquela aba sai célula por célula.
 
-`medir_tokens.py` compara quantos tokens a planilha gasta lida célula por célula vs. com fórmulas repetidas agrupadas.
-Roda 100% local e imprime só números, nenhum conteúdo da planilha.
+Roda 100% local. Nenhum dado sai da sua máquina.
+
+## Instalar
+
+Só precisa de Python 3.8+ e do openpyxl:
 
 ```
 pip install openpyxl
-python medir_tokens.py sua_planilha.xlsx
 ```
 
-Sem argumento, roda o auto-teste: `python medir_tokens.py`
+Copie o arquivo `excel_ai.py`. É um arquivo só, sem outras dependências. Link direto para copiar o código:
+https://raw.githubusercontent.com/xDisus/excel-ai/main/excel_ai.py
 
-Regra: redução de 5x ou mais, vale construir o resto.
+## Usar
+
+```
+python excel_ai.py sua_planilha.xlsx
+```
+
+Gera `sua_planilha.ai.txt` ao lado da planilha. É esse arquivo que você manda para a IA.
+Na tela aparecem só números: tokens antes e depois, e o resultado da conferência.
+
+Sem argumento, roda o auto-teste:
+
+```
+python excel_ai.py
+```
