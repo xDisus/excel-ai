@@ -641,6 +641,12 @@ def tipo_formato(nf):
     return "currency" if re.search(r"[$\u20ac\u00a3]", nf) else ""
 
 
+def texto_nota(comentario):
+    """Texto do comentario. Comentario encadeado vem com aviso fixo do Excel antes do texto; tira o aviso."""
+    t = re.sub(r"^\[(?:Coment\u00e1rio encadeado|Threaded comment)\].*?(?:Coment\u00e1rio|Comment):", "", comentario.text, flags=re.S)
+    return " ".join(t.split())
+
+
 def secao_extras(ws, so_estas=None):
     """(linhas de formatos, linhas de notas) de uma aba. Fatos lidos do arquivo, sem palpite."""
     por_tipo, notas = defaultdict(list), []
@@ -651,8 +657,8 @@ def secao_extras(ws, so_estas=None):
             t = tipo_formato(c.number_format)
             if t:
                 por_tipo[t].append((c.column, c.row))
-            if c.comment and c.comment.text.strip():
-                notas.append("%s note: %s" % (ref(c.row, c.column), " ".join(c.comment.text.split())[:LIMITE_NOTA]))
+            if c.comment and texto_nota(c.comment):
+                notas.append("%s note: %s" % (ref(c.row, c.column), texto_nota(c.comment)[:LIMITE_NOTA]))
     formatos = []
     for t, cels in sorted(por_tipo.items()):
         faixas, ini = [], None
@@ -1644,6 +1650,7 @@ def autoteste():
     assert "## Formats\ncurrency: B2:B4\ndate: C2\npercent: A2:A4" in taxas, taxas
     assert "## Notes\nA2 note: taxa anual em %" in taxas, taxas
     assert "## Formats" not in txt.split("# Sheet 'Limpa'")[1] and "## Notes" not in txt.split("# Sheet 'Limpa'")[1]
+    assert texto_nota(Comment("[Comentário encadeado]\n\nAviso. Saiba mais: http://x\n\nComentário:\n    Fraude = 0,10%", "x")) == "Fraude = 0,10%"
     assert tipo_formato("General") == "" and tipo_formato("0.00") == "" and tipo_formato("[$-409]m/d/yyyy") == "date"
     print("auto-teste ok")
 
