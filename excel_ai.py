@@ -843,11 +843,8 @@ def converter_diff(antiga, nova):
             bloco += ["## Constants"] + const[:LIMITE_CONSTANTES] + (["... %d more" % extra] if extra > 0 else [])
         corpo += bloco
 
-    nomes_a = dict(n.split(" = ", 1) for n in nomes_definidos(wb_a))
-    nomes_n = dict(n.split(" = ", 1) for n in nomes_definidos(wb_n))
-    nomes = (["%s added = %s" % (k, nomes_n[k]) for k in nomes_n if k not in nomes_a]
-             + ["%s removed (was %s)" % (k, nomes_a[k]) for k in nomes_a if k not in nomes_n]
-             + ["%s changed: %s -> %s" % (k, nomes_a[k], nomes_n[k]) for k in nomes_n if k in nomes_a and nomes_a[k] != nomes_n[k]])
+    nomes_a, nomes_n = set(nomes_definidos(wb_a)), set(nomes_definidos(wb_n))  # "NOME = destino"; destino novo = removido + novo
+    nomes = ["removed: " + n for n in sorted(nomes_a - nomes_n)] + ["added: " + n for n in sorted(nomes_n - nomes_a)]
 
     cabeca = [
         "# excel_ai diff (old -> new)",
@@ -1271,7 +1268,7 @@ def autoteste():
     assert "B2 2 -> 99" in texto and "E1 added novo" in texto and "A3 removed (was x3)" in texto and "C11 added 7" in texto, texto
     assert "A1 =S!D1+1" in texto and "A1 =S!D1\n" in texto
     assert "- sheet 'U' added (1 formulas)" in texto
-    assert "Taxa removed (was S!$B$2)" in texto and "Outra added = S!$B$3" in texto, texto
+    assert "removed: Taxa = S!$B$2" in texto and "added: Outra = S!$B$3" in texto, texto
     assert "C2:C4" not in texto and "SUM" not in texto  # o que nao mudou fica de fora
     assert n["formulas"] == 5 and n["antes"] == 6 and n["constantes"] == 4, n
     # preencher para baixo igual nao e mudanca (mesma formula relativa)

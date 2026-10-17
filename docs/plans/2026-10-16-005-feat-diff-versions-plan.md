@@ -29,7 +29,7 @@ The user keeps versioned calculators (v7.3, v7.4...). Two full dumps cost about 
 - R4. A cell that is a formula in one version and a constant (or empty) in the other counts as changed or removed on the formula side and shows the constant under Constants.
 - R5. Constants (non-formula cells) compared by value (`fmt()`): one line per cell `A1 old -> new`, `A1 added X`, `A1 removed (was X)`. Capped at 200 lines per sheet; the rest is summarized as `... N more`.
 - R6. Self-check: each formula section's lines must expand (`confere`) to exactly the formulas they stand for; on failure the section falls back to one formula per cell (`por_celula`) and the count is reported, like the normal dump.
-- R7. Defined names added, removed or with a different destination are listed under `## Defined names`.
+- R7. Defined names added or removed are listed (a changed destination shows as removed + added).
 - R8. Output file `<new stem>.vs_<old stem>.diff.ai.txt` (ASCII-sanitized). Console prints token count of the diff, changed counts and the self-check result.
 - R9. Real calculator (local only): diff the file against itself gives "no changes" with 100% check; against a locally edited copy (change a few cells) shows exactly those. Under 1 minute.
 
