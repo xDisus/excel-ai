@@ -112,7 +112,7 @@ R1 to R7 met, legend and README updated, auto-test green, existing fixture outpu
 
 ## Achados de execuções anteriores
 
-- Plano 008 (PR #14) entregou `redigir`, `ler_membro`, `xml_seguro`, `_injetar`, `bloco_livro` e a lista `secoes_livro` em `converter()` (emitida só quando `cadeia is None`). Para usar: `secoes_livro.append(linhas)`.
+- Plano 008 (PR #14) entregou `redigir`, `ler_membro`, `xml_seguro`, `_injetar`, `bloco_livro` e a lista `secoes_livro` em `converter()` (emitida só quando `cadeia is None`). Plano 011 mudou isso: `secoes_livro` é um dict, use `secoes_livro["Connections"|"Queries"|"Macros"] = ["## Nome"] + linhas`; a ordem fixa vem de `ORDEM_LIVRO`. Linha de legenda no cabeçalho só quando a seção existe (veja `External links` em `converter`).
 - `ler_membro` levanta `KeyError` (membro ausente) e `ValueError` (acima do teto); `xml_seguro` levanta `ValueError` (DOCTYPE ou XML ilegível). Capture os dois.
 - `redigir` é best-effort: valor sem aspas de `password=`/`key=` vai até `;`, `,`, `&` ou fim de linha; caminhos POSIX só em /home,/Users,/root,/mnt,/media,/var,/tmp,/opt. Nos testes, plante segredos reais (`hunter2`) e confira que sumiram E que o resto ficou.
 - Teste só com venv: `/tmp/claude-0/venv/bin/python excel_ai.py` (sem openpyxl no sistema). Mantenha o fonte em ASCII e compatível com Python 3.8.

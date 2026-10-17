@@ -474,9 +474,37 @@ def _injetar(buf, partes):
     return saida
 
 
+ORDEM_LIVRO = ("Connections", "Queries", "External links", "Macros")
+
+
 def bloco_livro(secoes):
-    """Bloco '# Workbook' com as secoes do livro todo (listas de linhas, na ordem dada); vazio se nenhuma tem conteudo."""
-    return ["", "# Workbook"] + [l for s in secoes for l in s] if any(secoes) else []
+    """Bloco '# Workbook' com as secoes do livro todo ({nome: linhas}, na ordem ORDEM_LIVRO); vazio se nenhuma tem conteudo."""
+    linhas = [l for k in ORDEM_LIVRO for l in secoes.get(k, [])]
+    return ["", "# Workbook"] + linhas if linhas else []
+
+
+def links_externos(wb, textos):
+    """(linhas, avisos) dos links para outras planilhas, na ordem de [N] nas formulas. Nunca abre o arquivo ligado.
+    textos = todas as formulas do livro, para contar o uso de cada [N]. wb._external_links nao e API publica."""
+    # ponytail: "[1]x" dentro de texto entre aspas tambem conta; raro, so afeta o numero
+    uso = Counter(int(i) for t in textos for i in set(re.findall(r"\[(\d+)\](?=[\w'])", t)))
+    linhas, avisos = [], []
+    for n, link in enumerate(getattr(wb, "_external_links", None) or [], 1):
+        try:
+            alvo = redigir(str(link.file_link.Target))
+            if "://" not in alvo:
+                alvo = re.split(r"[\\/]", re.split(r"[?#]", alvo)[0])[-1]  # so o nome do arquivo
+            alvo = " ".join(alvo.split()) or "unknown target"
+            if "://" in alvo:
+                avisos.append("- external link [%d] points to a URL: %s" % (n, alvo))
+            livro = link.externalBook
+            abas = [" ".join(str(a).split()) for a in livro.sheetNames.sheetName] if livro.sheetNames else []
+            if livro.sheetDataSet is None:
+                avisos.append("- external link [%d] has no saved values: formula results that use it cannot be trusted" % n)
+        except Exception:
+            alvo, abas = "unknown target", []
+        linhas.append("[%d] %s%s, %d formulas" % (n, alvo, ", sheets: " + ", ".join(abas) if abas else "", uso[n]))
+    return linhas, avisos
 
 
 def nomes_definidos(wb):
@@ -820,7 +848,8 @@ def converter(fonte, alvo=None):
     ja_vistas = []  # (nome, esperado) das abas anteriores
     s_form = s_dados = 0
     ha_pivots = False
-    secoes_livro = []  # secoes do livro todo (cada uma, uma lista de linhas), emitidas uma vez no fim
+    secoes_livro = {}  # {nome em ORDEM_LIVRO: linhas}; emitidas uma vez no fim, so fora do --celula
+    todos_textos = []
 
     abas, bruto_chars, sem_cache = ler_abas(wb, wb_v)
 
@@ -840,6 +869,8 @@ def converter(fonte, alvo=None):
 
         textos = [f[1] for f in formulas.values() if f[0] in "fa"]
         total_formulas += len(textos)
+        if cadeia is None:
+            todos_textos += textos
         meu = esperado(formulas)
 
         # avisos da aba
@@ -916,6 +947,10 @@ def converter(fonte, alvo=None):
         corpo += bloco
 
     if cadeia is None:
+        links, avisos_links = links_externos(wb, todos_textos)
+        if links:
+            secoes_livro["External links"] = ["## External links"] + links
+            avisos += avisos_links
         corpo += bloco_livro(secoes_livro)
     wb_v.close()  # read_only segura o arquivo aberto
     if tem_vba(fonte):
@@ -944,6 +979,8 @@ def converter(fonte, alvo=None):
     ]
     if ha_pivots:
         cabeca.append("'## Pivots' lists pivot tables: where each sits, what feeds it, and which fields are rows, columns, filters and values.")
+    if "External links" in secoes_livro:
+        cabeca.append("'## External links' (after the last sheet) maps each [N] in formulas to the workbook it points to; the linked file is never opened.")
     if cadeia is not None:
         aba, r, c = alvo_pos
         valor = next(cc for w, _, _, cc in abas if w.title == aba).get((r, c))
@@ -1275,6 +1312,7 @@ Read `references/format.md` for the full legend. Short version:
 - Per sheet `## Formats` (only when present): cells Excel shows as `percent`, `date` or `currency`, as ranges (`percent: D2:D101, F2`). Use it to tell a rate from an amount. Only cells with a value are listed.
 - Per sheet `## Notes` (only when present): the author's cell comments, `B5 note: <text>` (200 characters max, 100 per sheet). Treat them as the author's own explanation of assumptions.
 - Per sheet `## Pivots` (only when present): each pivot table with where it sits, its source and its row, column, filter and value fields (`values: Soma de Valor = sum(Valor)`). The numbers it produced are ordinary cells in `## Data`; this section says they are a summary of the source. A warning appears when it refreshes on open.
+- After the last sheet, `# Workbook` holds workbook-level sections (only when present). `## External links`: `[1] taxas.xlsx, sheets: T, 3 formulas` says `[1]` in formulas (`=[1]T!B2`) is that file, shown by name only (no folder), with the cached sheet names and how many formulas use it. The linked file is never opened. Warnings flag links without saved values and links to URLs.
 
 Reason about the logic from the formulas: say what each block computes, which sheets feed it, and where inputs live. Use cached values `(v ...)` only as sanity checks; they may be stale.
 
@@ -1371,6 +1409,16 @@ A2 note: taxa anual em %
 
 One block per pivot table, after `## Notes`. `source` is a sheet range, `table or name X` (Excel does not say which), or the cache type when it is not a worksheet. `Values` in `columns` or `rows` is the values axis. Only the definition is shown, never a re-computation. `--celula` and `--diff` ignore pivots.
 
+## Workbook sections
+
+```
+# Workbook
+## External links
+[1] taxas.xlsx, sheets: T, 3 formulas
+```
+
+Emitted once, after the last sheet, in this order when present: Connections, Queries, External links, Macros. `[N]` is the 1-based position of the link; formulas keep `[N]` unchanged. Paths are reduced to file names and URL query strings are dropped. `--celula` and `--diff` omit this block.
+
 ## Warnings you may see
 
 - `N formulas contain #REF!` broken reference.
@@ -1378,6 +1426,7 @@ One block per pivot table, after `## Notes`. `source` is a sheet range, `table o
 - `N formulas use OFFSET/INDIRECT` target decided at run time; not followable statically.
 - `N data-table (what-if) cells`.
 - `File has VBA macros`.
+- `external link [N] has no saved values` / `points to a URL`.
 - `pivot 'X' refreshes when the file opens` its numbers may differ from the saved ones.
 - `No calculated values saved in the file`.
 - `compact view failed the self-check on N sheet(s)` those sheets are one formula per cell.
@@ -1880,7 +1929,37 @@ def autoteste():
         except ValueError:
             pass
     assert xml_seguro(b"<a><b/></a>").tag == "a"
-    assert bloco_livro([[], []]) == [] and bloco_livro([[], ["## X", "l"]]) == ["", "# Workbook", "## X", "l"]
+    assert bloco_livro({}) == [] and bloco_livro({"Macros": ["## M"], "Connections": ["## C"]}) == ["", "# Workbook", "## C", "## M"]
+    # links externos: [N] -> arquivo, so o nome, contagem por indice, avisos
+    from openpyxl.packaging.relationship import Relationship
+    from openpyxl.workbook.external_link.external import ExternalBook, ExternalLink, ExternalSheetNames
+
+    def _link(alvo, abas=("T",)):
+        k = ExternalLink(externalBook=ExternalBook(sheetNames=ExternalSheetNames(list(abas)), id="rId1"))
+        k.file_link = Relationship(type="externalLinkPath", Target=alvo, TargetMode="External", Id="rId1")
+        return k
+    wbl = Workbook()
+    wl = wbl.active
+    wl.title = "A"
+    wl["A1"], wl["A2"], wl["A3"] = "=[1]T!B2", "=[1]T!B3+[1]T!B4", "=SUM([2]T!B2:B3)"
+    wl["A4"] = "=Tab[Col]+{1,2}"
+    wl["A5"] = "=[2]2020!A1"
+    wl2 = wbl.create_sheet("B")
+    wl2["A1"] = "=[1]T!B9"
+    wbl._external_links += [_link("file:///C:\\Users\\ana\\Docs\\taxas%20x.xlsx"), _link("https://user:pw9@h.com/d/p.xlsx?sig=zzz9", ("T", "U")),
+                            _link("..\\ana\\rel.xlsx?sig=zzz8")]
+    bio = io.BytesIO()
+    wbl.save(bio)
+    txt, _ = converter(bio)
+    wl_txt = txt.split("\n# Workbook\n")[1]
+    assert wl_txt == ("## External links\n[1] taxas x.xlsx, sheets: T, 3 formulas\n"
+                      "[2] https://h.com/d/p.xlsx, sheets: T, U, 2 formulas\n[3] rel.xlsx, sheets: T, 0 formulas\n"), wl_txt
+    assert not any(x in txt for x in ("ana", "pw9", "zzz9", "zzz8", "Users"))
+    assert "- external link [1] has no saved values" in txt and "- external link [2] points to a URL: https://h.com/d/p.xlsx" in txt
+    assert txt.index("# Workbook") > txt.index("# Sheet 'B'") and "'## External links' (after the last sheet)" in txt
+    assert "# Workbook" not in converter(bio, "A!A1")[0]
+    wbl._external_links[0].file_link = None  # destino ilegivel: sem excecao
+    assert links_externos(wbl, [])[0][0].startswith("[1] unknown target")
     print("auto-teste ok")
 
 

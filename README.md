@@ -41,6 +41,8 @@ Se a planilha tem tabelas dinâmicas, o arquivo ganha uma seção `## Pivots` po
   values: Soma de Valor = sum(Valor)
 ```
 
+Se há links para outras planilhas (`=[1]Taxas!B2`), o final do arquivo ganha `# Workbook` / `## External links`: `[1] taxas.xlsx, sheets: T, 3 formulas`. Só o nome do arquivo aparece, nunca a pasta; o arquivo ligado não é aberto.
+
 Para olhar uma conta só (por exemplo a TIR final), passe a célula:
 
 ```
