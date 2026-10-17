@@ -56,6 +56,16 @@ python excel_ai.py minha_pasta
 
 Cada `.xlsx`/`.xlsm` gera o seu `.ai.txt` ao lado. Se uma falhar, as outras seguem.
 
+## Skill do Kiro
+
+Para o Kiro usar a ferramenta sozinho quando você falar de planilha:
+
+```
+python excel_ai.py --instalar-skill
+```
+
+Grava a skill em `~/.kiro/skills/excel-ai`. Se já existir, pula; `--forcar` sobrescreve. A skill vem de dentro do próprio `excel_ai.py`.
+
 Sem argumento, roda o auto-teste:
 
 ```
