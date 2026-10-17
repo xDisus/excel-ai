@@ -24,6 +24,8 @@ import shutil
 import sys
 import zipfile
 from collections import Counter, defaultdict
+from urllib.parse import unquote, urlsplit
+from xml.etree import ElementTree
 
 try:
     from openpyxl import Workbook, load_workbook
@@ -41,6 +43,7 @@ LIMITE_TEXTOS = 50     # idem para textos (menor que isso costuma ser rotulo; fi
 LIMITE_NOTA = 200      # caracteres de cada nota (comentario de celula)
 LIMITE_NOTAS = 100     # notas por aba
 LIMITE_FAIXAS = 50     # faixas por tipo de formato e aba
+LIMITE_PIVOTS = 50     # tabelas dinamicas por aba
 AMOSTRA = 3            # quantos primeiros valores o resumo mostra
 RATIO_DUPLICADA = 0.8  # fracao de formulas iguais para tratar a aba como copia
 ERROS = ("#N/A", "#REF!", "#VALUE!", "#DIV/0!", "#NAME?", "#NUM!", "#NULL!", "#SPILL!", "#CALC!")
@@ -411,6 +414,71 @@ def tem_vba(fonte):
         return False
 
 
+MAX_MEMBRO = 5 * 2 ** 20  # bytes lidos de um membro do zip (entrada nao confiavel)
+RE_URL = re.compile(r"(?!file:)[a-z][a-z0-9+.-]{1,10}://[^\s\"'<>]+", re.I)
+RE_URL_ARQUIVO = re.compile(r"file:/{2,3}(?:[^\s\"'<>|;]*/)*([^\s\"'<>|;/]*)", re.I)
+RE_CAMINHO_WIN = re.compile(r"(?:(?<!\w)[A-Za-z]:[\\/]|\\\\[^\\\s\"']+\\)(?:[^\\/\r\n\"'<>|;]*[\\/])*")
+RE_CAMINHO_NIX = re.compile(r"(?<![\w:/.])/(?:home|Users|root|mnt|media|var|tmp|opt)/(?:[^/\s\"'<>|;]*/)*")
+RE_BEARER = re.compile(r"\b(bearer|basic)\s+[^\s\"',;)\]]+", re.I)
+RE_SEGREDO = re.compile(r"(\b\w{0,40}(?:password|pwd|key|token|secret|authorization)\b)\s*[=:]\s*"
+                        r"(?:\"[^\"]*\"|'[^']*'|[^;,&\"')\]\r\n]+)", re.I)
+RE_EMAIL = re.compile(r"[\w.+-]{1,64}@[\w-]+(?:\.[\w-]+)+")
+
+
+def _url_limpa(m):
+    try:
+        u = urlsplit(m.group(0))
+        return "%s://%s%s" % (u.scheme, u.netloc.rpartition("@")[2], u.path)
+    except ValueError:  # URL malformada: corta no primeiro ? ou #
+        return re.split(r"[?#]", m.group(0))[0].rpartition("@")[2]
+
+
+def redigir(texto):
+    """Tira de um texto o que identifica quem usa a planilha: so o nome do arquivo de cada caminho,
+    URL sem query, fragmento e usuario, e valores depois de chaves como password/token. Redigir antes de truncar."""
+    t = RE_URL.sub(_url_limpa, texto)
+    t = RE_URL_ARQUIVO.sub(lambda m: unquote(m.group(1)), t)
+    t = RE_CAMINHO_NIX.sub("", RE_CAMINHO_WIN.sub("", t))
+    t = RE_SEGREDO.sub(lambda m: m.group(1) + "=***", RE_BEARER.sub(lambda m: m.group(1) + " ***", t))
+    return RE_EMAIL.sub("***@***", t)
+
+
+def ler_membro(zf, nome, maximo=MAX_MEMBRO):
+    """Bytes de um membro do zip; ValueError se o tamanho declarado passa do teto, KeyError se nao existe."""
+    if zf.getinfo(nome).file_size > maximo:
+        raise ValueError("%s is larger than %d bytes" % (nome, maximo))
+    return zf.read(nome)
+
+
+def xml_seguro(dados):
+    """Parse de XML que vem do arquivo; recusa DOCTYPE/ENTITY (entidades que explodem)."""
+    if re.search(rb"<!(?:DOCTYPE|ENTITY)", dados.replace(b"\x00", b""), re.I):
+        raise ValueError("XML with DOCTYPE/ENTITY refused")
+    try:
+        return ElementTree.fromstring(dados)
+    except ElementTree.ParseError as e:
+        raise ValueError("XML not readable: %s" % e)
+
+
+def _injetar(buf, partes):
+    """Copia o zip buf (BytesIO) para um novo, acrescentando/trocando {caminho: bytes}. So para testes."""
+    buf.seek(0)
+    saida = io.BytesIO()
+    with zipfile.ZipFile(buf) as z, zipfile.ZipFile(saida, "w", zipfile.ZIP_DEFLATED) as o:
+        for i in z.infolist():
+            if i.filename not in partes:
+                o.writestr(i, z.read(i.filename))
+        for nome, dados in partes.items():
+            o.writestr(nome, dados)
+    saida.seek(0)
+    return saida
+
+
+def bloco_livro(secoes):
+    """Bloco '# Workbook' com as secoes do livro todo (listas de linhas, na ordem dada); vazio se nenhuma tem conteudo."""
+    return ["", "# Workbook"] + [l for s in secoes for l in s] if any(secoes) else []
+
+
 def nomes_definidos(wb):
     return ["%s = %s" % (d.name, d.attr_text) for d in _nomes(wb)]
 
@@ -679,6 +747,64 @@ def secao_extras(ws, so_estas=None):
     return formatos, notas
 
 
+def _pivot(p):
+    """(linhas, avisos) de uma tabela dinamica. Campos vem do cache pelo indice."""
+    una = lambda x: " ".join(str(x).split())
+    nome = una(p.name or "?")
+    cache = getattr(p, "cache", None)
+    campos = [f.name for f in cache.cacheFields] if cache is not None else []
+
+    def campo(i):
+        if i == -2:
+            return "Values"
+        return una(campos[i]) if 0 <= i < len(campos) and campos[i] else "field %s" % i
+
+    fonte, avisos = "source unknown", []
+    nao_le = "pivot '%s' source could not be read" % nome
+    src = getattr(cache, "cacheSource", None)
+    if src is None:
+        avisos.append("pivot '%s' has no readable cache, source unknown" % nome)
+    elif src.type == "worksheet" and src.worksheetSource is not None:
+        w = src.worksheetSource
+        if w.name:
+            fonte = "table or name %s" % una(w.name)
+        elif w.sheet and w.ref:
+            fonte = "'%s'!%s" % (una(w.sheet), una(w.ref))
+        else:
+            avisos.append(nao_le)
+    elif src.type and src.type != "worksheet":
+        fonte = "%s (not a worksheet range)" % src.type
+    else:
+        avisos.append(nao_le)
+    if cache is not None and cache.refreshOnLoad:
+        avisos.append("pivot '%s' refreshes when the file opens: its numbers may differ from what the file shows" % nome)
+    linhas = ["- '%s' at %s, source %s" % (nome, una(p.location.ref) if p.location is not None else "?", fonte)]
+    for papel, itens in (("rows", [campo(x.x) for x in p.rowFields]),
+                         ("columns", [campo(x.x) for x in p.colFields]),
+                         ("filters", [campo(x.fld) for x in p.pageFields]),
+                         ("values", ["%s = %s(%s)" % (una(d.name or "?"), d.subtotal, campo(d.fld)) for d in p.dataFields])):
+        if itens:
+            linhas.append("  %s: %s" % (papel, ", ".join(itens)))
+    return linhas, avisos
+
+
+def secao_pivots(ws):
+    """(linhas, avisos) das tabelas dinamicas de uma aba. Fatos lidos do arquivo, sem palpite;
+    ws._pivots nao e API publica, entao qualquer erro vira um aviso."""
+    pivots = list(getattr(ws, "_pivots", None) or [])
+    linhas, avisos = [], []
+    for p in pivots[:LIMITE_PIVOTS]:
+        try:
+            l, a = _pivot(p)
+        except Exception:
+            l, a = ["- pivot unreadable"], ["a pivot could not be read"]
+        linhas += l
+        avisos += ["- '%s': %s" % (ws.title, x) for x in a]
+    if len(pivots) > LIMITE_PIVOTS:
+        linhas.append("(+%d more pivots)" % (len(pivots) - LIMITE_PIVOTS))
+    return linhas, avisos
+
+
 def converter(fonte, alvo=None):
     """Retorna (texto, numeros). fonte = caminho ou arquivo aberto.
     alvo = "Aba!B5": so a cadeia de precedentes dessa celula."""
@@ -693,6 +819,8 @@ def converter(fonte, alvo=None):
     falhas, total_formulas = [], 0
     ja_vistas = []  # (nome, esperado) das abas anteriores
     s_form = s_dados = 0
+    ha_pivots = False
+    secoes_livro = []  # secoes do livro todo (cada uma, uma lista de linhas), emitidas uma vez no fim
 
     abas, bruto_chars, sem_cache = ler_abas(wb, wb_v)
 
@@ -769,6 +897,8 @@ def converter(fonte, alvo=None):
 
         linhas_d = secao_dados(valores)
         formatos, notas = secao_extras(ws, meus if cadeia is not None else None)
+        pivots, avisos_pivots = secao_pivots(ws) if cadeia is None else ([], [])
+        avisos += avisos_pivots
         bloco = ["", "# Sheet %s" % nome]
         if linhas_f:
             bloco += ["## Formulas"] + linhas_f
@@ -778,10 +908,15 @@ def converter(fonte, alvo=None):
             bloco += ["## Formats"] + formatos
         if notas:
             bloco += ["## Notes"] + notas
+        if pivots:
+            bloco += ["## Pivots"] + pivots
+            ha_pivots = True
         s_form += tokens("\n".join(linhas_f))
         s_dados += tokens("\n".join(linhas_d))
         corpo += bloco
 
+    if cadeia is None:
+        corpo += bloco_livro(secoes_livro)
     wb_v.close()  # read_only segura o arquivo aberto
     if tem_vba(fonte):
         avisos.insert(0, "- File has VBA macros: some values may be written by a macro, not by formulas.")
@@ -807,6 +942,8 @@ def converter(fonte, alvo=None):
         "'same formulas as X' means the sheet is a copy of X except the listed cells.",
         "'## Formats' lists cells shown as percent/date/currency in Excel; '## Notes' has the cell comments (author text).",
     ]
+    if ha_pivots:
+        cabeca.append("'## Pivots' lists pivot tables: where each sits, what feeds it, and which fields are rows, columns, filters and values.")
     if cadeia is not None:
         aba, r, c = alvo_pos
         valor = next(cc for w, _, _, cc in abas if w.title == aba).get((r, c))
@@ -1137,6 +1274,7 @@ Read `references/format.md` for the full legend. Short version:
 - Per sheet `## Data`: constants, with long number runs summarized as `[100 numbers] min .. max .. first: ..`.
 - Per sheet `## Formats` (only when present): cells Excel shows as `percent`, `date` or `currency`, as ranges (`percent: D2:D101, F2`). Use it to tell a rate from an amount. Only cells with a value are listed.
 - Per sheet `## Notes` (only when present): the author's cell comments, `B5 note: <text>` (200 characters max, 100 per sheet). Treat them as the author's own explanation of assumptions.
+- Per sheet `## Pivots` (only when present): each pivot table with where it sits, its source and its row, column, filter and value fields (`values: Soma de Valor = sum(Valor)`). The numbers it produced are ordinary cells in `## Data`; this section says they are a summary of the source. A warning appears when it refreshes on open.
 
 Reason about the logic from the formulas: say what each block computes, which sheets feed it, and where inputs live. Use cached values `(v ...)` only as sanity checks; they may be stale.
 
@@ -1220,6 +1358,19 @@ A2 note: taxa anual em %
 
 `percent` / `date` / `currency` come from the cell's number format in Excel; other formats (General, plain numbers, text) are not listed. Ranges run down a column; long lists end with `(+N more)`. `## Notes` holds cell comments verbatim (whitespace collapsed). With `--celula`, only the cells in the chain are listed. `--diff` ignores both.
 
+## Pivots
+
+```
+## Pivots
+- 'Piv1' at A3:B8, source 'Dados'!A1:C6
+  rows: Mes
+  columns: Values
+  filters: Reg
+  values: Soma de Valor = sum(Valor)
+```
+
+One block per pivot table, after `## Notes`. `source` is a sheet range, `table or name X` (Excel does not say which), or the cache type when it is not a worksheet. `Values` in `columns` or `rows` is the values axis. Only the definition is shown, never a re-computation. `--celula` and `--diff` ignore pivots.
+
 ## Warnings you may see
 
 - `N formulas contain #REF!` broken reference.
@@ -1227,6 +1378,7 @@ A2 note: taxa anual em %
 - `N formulas use OFFSET/INDIRECT` target decided at run time; not followable statically.
 - `N data-table (what-if) cells`.
 - `File has VBA macros`.
+- `pivot 'X' refreshes when the file opens` its numbers may differ from the saved ones.
 - `No calculated values saved in the file`.
 - `compact view failed the self-check on N sheet(s)` those sheets are one formula per cell.
 - `--celula` only: `unresolved` / `formula not parsed` refs that could not be followed.
@@ -1652,6 +1804,83 @@ def autoteste():
     assert "## Formats" not in txt.split("# Sheet 'Limpa'")[1] and "## Notes" not in txt.split("# Sheet 'Limpa'")[1]
     assert texto_nota(Comment("[Comentário encadeado]\n\nAviso. Saiba mais: http://x\n\nComentário:\n    Fraude = 0,10%", "x")) == "Fraude = 0,10%"
     assert tipo_formato("General") == "" and tipo_formato("0.00") == "" and tipo_formato("[$-409]m/d/yyyy") == "date"
+    # pivots: leitura de objetos em memoria + ida e volta pelo arquivo; sem pivot nada muda
+    from openpyxl.pivot.cache import CacheDefinition, CacheField, CacheSource, WorksheetSource
+    from openpyxl.pivot.table import DataField, Location, PageField, RowColField, TableDefinition
+    wbp = Workbook()
+    dp = wbp.active
+    dp.title = "Dados"
+    dp.append(["Mes", "Valor", "Reg"])
+    for i in range(5):
+        dp.append(["m%d" % i, i, "a"])
+    rp = wbp.create_sheet("Resumo")
+    cachep = CacheDefinition(cacheSource=CacheSource(type="worksheet", worksheetSource=WorksheetSource(ref="A1:C6", sheet="Dados")),
+                             cacheFields=[CacheField(name="Mes"), CacheField(name="Valor"), CacheField(name="Reg")], refreshOnLoad=True)
+    pivp = TableDefinition(name="Piv1", cacheId=0, dataCaption="Values", location=Location(ref="A3:B8", firstHeaderRow=1, firstDataRow=1, firstDataCol=1),
+                           rowFields=[RowColField(x=0)], colFields=[RowColField(x=-2)], pageFields=[PageField(fld=2)],
+                           dataFields=[DataField(name="Soma de Valor", fld=1, subtotal="sum"), DataField(name="N", fld=0, subtotal="count")])
+    pivp.cache = cachep
+    rp.add_pivot(pivp)
+    bio = io.BytesIO()
+    wbp.save(bio)
+    txt, _ = converter(bio)
+    resumo = txt.split("# Sheet 'Resumo'")[1]
+    assert ("## Pivots\n- 'Piv1' at A3:B8, source 'Dados'!A1:C6\n  rows: Mes\n  columns: Values\n  filters: Reg\n"
+            "  values: Soma de Valor = sum(Valor), N = count(Mes)") in resumo, resumo
+    assert "- 'Resumo': pivot 'Piv1' refreshes when the file opens" in txt
+    assert "'## Pivots' lists pivot tables" in txt and "## Pivots" not in txt.split("# Sheet 'Dados'")[1].split("# Sheet 'Resumo'")[0]
+    assert "## Pivots" not in converter(bio, "Dados!A1")[0]  # --celula: nada de pivot
+    assert "## Pivots" not in converter(_fixture())[0] and "# Workbook" not in converter(_fixture())[0]
+    # formatador com objetos parciais: fonte por nome de tabela, so valores, indice fora do intervalo, sem cache
+    pivp.cache = None
+    assert secao_pivots(rp)[0][0].endswith("source unknown") and "no readable cache" in secao_pivots(rp)[1][0]
+    c2 = CacheDefinition(cacheSource=CacheSource(type="worksheet", worksheetSource=WorksheetSource(name="Tabela1")), cacheFields=[CacheField(name="X")])
+    p2 = TableDefinition(name="P2", cacheId=0, dataCaption="Values", location=Location(ref="A1:A2", firstHeaderRow=1, firstDataRow=1, firstDataCol=1),
+                         colFields=[RowColField(x=9)], dataFields=[DataField(name="T", fld=0, subtotal="max")])
+    p2.cache = c2
+    l2, a2 = _pivot(p2)
+    assert l2 == ["- 'P2' at A1:A2, source table or name Tabela1", "  columns: field 9", "  values: T = max(X)"] and not a2, l2
+    p2.cache.cacheSource = CacheSource(type="external", connectionId=1)
+    assert _pivot(p2)[0][0].endswith("source external (not a worksheet range)")
+    rp._pivots = [object()]  # objeto ilegivel: aviso, sem excecao
+    assert secao_pivots(rp) == (["- pivot unreadable"], ["- 'Resumo': a pivot could not be read"])
+
+    # ajudantes compartilhados: planta segredos de verdade e confere que sumiram E que o resto ficou
+    r = redigir("C:\\Users\\ana\\Docs\\taxas.xlsx")
+    assert r == "taxas.xlsx", r
+    assert redigir("\\\\srv\\share\\ana\\x.xlsx") == "x.xlsx" and redigir("/home/ana/x.xlsx") == "x.xlsx"
+    assert redigir("file:///x/ana/y%20z.xlsx") == "y z.xlsx"
+    r = redigir("https://user:pw9@h.com/p/a.xlsx?api_key=zzz9#frag9")
+    assert r == "https://h.com/p/a.xlsx", r
+    r = redigir('x [Password = "hunter2"] Server=db;PWD=hunter3; mail ana@corp.com; ApiKey=abc9')
+    assert not any(k in r for k in ("hunter2", "hunter3", "abc9", "ana@")) and "Server=db" in r and "***@***" in r, r
+    r = redigir('Web.Contents("https://h/p", [Headers=[Authorization="Bearer abc9"]])')
+    assert "abc9" not in r and "https://h/p" in r, r
+    assert redigir("ftp://u:pw9@h/x") == "ftp://h/x" and redigir("D:/Users/ana/x.xlsx") == "x.xlsx"
+    assert "dXNl" not in redigir("Authorization: Basic dXNlcjpwdw==") and redigir("see http://[x").startswith("see http://")
+    assert redigir("PWD=pa ss;Server=db") == "PWD=***;Server=db"
+    import time
+    t0 = time.time()
+    redigir("a" * 200000)
+    assert time.time() - t0 < 5, "redigir quadratico"
+    assert redigir("=SUM(A1:A3)") == "=SUM(A1:A3)"
+    z = _injetar(_fixture(), {"xl/extra.bin": b"zz"})
+    assert zipfile.ZipFile(z).read("xl/extra.bin") == b"zz"
+    load_workbook(z)
+    assert ler_membro(zipfile.ZipFile(z), "xl/extra.bin") == b"zz"
+    try:
+        ler_membro(zipfile.ZipFile(z), "xl/extra.bin", 1)
+        assert False, "teto nao aplicado"
+    except ValueError:
+        pass
+    for ruim in (b'<?xml version="1.0"?><!DOCTYPE a [<!ENTITY e "x">]><a>&e;</a>', '<!DOCTYPE a><a/>'.encode("utf-16")):
+        try:
+            xml_seguro(ruim)
+            assert False, "DOCTYPE aceito"
+        except ValueError:
+            pass
+    assert xml_seguro(b"<a><b/></a>").tag == "a"
+    assert bloco_livro([[], []]) == [] and bloco_livro([[], ["## X", "l"]]) == ["", "# Workbook", "## X", "l"]
     print("auto-teste ok")
 
 

@@ -3,6 +3,7 @@ title: "feat: Precedent chain of one cell (--celula)"
 type: feat
 date: 2026-10-16
 artifact_contract: ce-unified-plan/v1
+status: completed
 artifact_readiness: implementation-ready
 execution: code
 product_contract_source: ce-plan-bootstrap
