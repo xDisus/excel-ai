@@ -1,10 +1,14 @@
 """excel_ai: converte uma planilha Excel em texto compacto para uma IA ler.
 
 Uso:   python excel_ai.py planilha.xlsx     (gera planilha.ai.txt ao lado)
+       python excel_ai.py planilha.xlsx --celula "Aba!B5"   (so o que essa celula usa)
+       python excel_ai.py antiga.xlsx nova.xlsx --diff      (so o que mudou entre as duas)
+       python excel_ai.py pasta                             (todas as planilhas da pasta)
 Teste: python excel_ai.py                   (sem argumento roda o auto-teste)
 
 Roda 100% local. Unica dependencia: openpyxl (pip install openpyxl).
 """
+import bisect
 import datetime
 import io
 import os
@@ -34,7 +38,7 @@ PECA_LINHA = re.compile(r"^(\$?)(\d+)$")
 # ponytail: regex pode achar nome de aba dentro de texto entre aspas; raro, so afeta o mapa.
 NOME_ABA = r"'((?:[^']|'')+)'|([^\W\d][\w.]*)"  # 'Aba com espaco' ou Aba
 RE_ABA = re.compile(r"(?<![#\w.\]])(?:%s)!" % NOME_ABA)
-RE_BLOCO = re.compile(r"^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))? (?:\[[^\]]*\] )?(=.*)$")
+RE_BLOCO = re.compile(r"^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))? (?:\[[^\]]*\] )?(?:\(v [^)]*\) )?(=.*)$")
 RE_MATRIZ = re.compile(r"^([A-Z]+\d+) array (\S+) \{(=.*)\}$")
 RE_EXCECAO = re.compile(r"^  except ([A-Z]+\d+) (.*)$")
 RE_SUMIU = re.compile(r"^([A-Z]+\d+) no formula$")
@@ -131,8 +135,17 @@ def rotulo(formulas, valores, r, c, dr, dc):
     return None
 
 
-def blocos(formulas, valores, vertical, buraco="blank"):
-    """Junta celulas vizinhas com o mesmo padrao. Uma celula diferente no meio vira 'except'."""
+def valor_curto(v):
+    """Valor calculado em poucos caracteres, sem ')' (a dica '(v X)' nao entra na formula)."""
+    if v is None:
+        return ""
+    return " ".join(fmt(v).replace(")", "").split())[:20]
+
+
+def blocos(formulas, valores, vertical, buraco="blank", contexto=None, cache=None):
+    """Junta celulas vizinhas com o mesmo padrao. Uma celula diferente no meio vira 'except'.
+    contexto = (todas as formulas, todos os valores) da aba, so para achar rotulos."""
+    todas, todos = contexto or (formulas, valores)
     por_linha = defaultdict(list)
     for (r, c) in formulas:
         por_linha[c if vertical else r].append(r if vertical else c)
@@ -181,14 +194,17 @@ def blocos(formulas, valores, vertical, buraco="blank"):
                 continue
             faixa = ref(*ini) if p0 == p1 else ref(*ini) + ":" + ref(*cel(p1))
             if p0 == p1:  # celula sozinha: esquerda; acima so se a esquerda estiver vazia
-                nome = rotulo(formulas, valores, ini[0], ini[1], 0, -1)
+                nome = rotulo(todas, todos, ini[0], ini[1], 0, -1)
                 if nome is None:
-                    nome = rotulo(formulas, valores, ini[0], ini[1], -1, 0)
+                    nome = rotulo(todas, todos, ini[0], ini[1], -1, 0)
             else:
                 dr, dc = (-1, 0) if vertical else (0, -1)
-                nome = rotulo(formulas, valores, ini[0], ini[1], dr, dc)
+                nome = rotulo(todas, todos, ini[0], ini[1], dr, dc)
             if nome:
                 faixa += " [%s]" % nome
+            dica = valor_curto((cache or {}).get(ini)) if p0 != p1 else ""  # celula sozinha: sem dica (custa token demais)
+            if dica:
+                faixa += " (v %s)" % dica
             saida.append("%s %s" % (faixa, limpa(formulas[ini][1])))
             for p in excecoes:
                 f = formulas.get(cel(p))
@@ -266,10 +282,11 @@ def confere(linhas, meu, base=None):
         return False
 
 
-def secao_formulas(formulas, valores, buraco="blank"):
+def secao_formulas(formulas, valores, buraco="blank", contexto=None, cache=None):
     if not formulas:
         return []
-    return min(blocos(formulas, valores, True, buraco), blocos(formulas, valores, False, buraco),
+    return min(blocos(formulas, valores, True, buraco, contexto, cache),
+               blocos(formulas, valores, False, buraco, contexto, cache),
                key=lambda b: len("\n".join(b)))
 
 
@@ -380,28 +397,197 @@ def tem_vba(fonte):
 
 
 def nomes_definidos(wb):
+    return ["%s = %s" % (d.name, d.attr_text) for d in _nomes(wb)]
+
+
+def _nomes(wb, globais=False):
     dn = wb.defined_names
     lista = list(dn.values()) if hasattr(dn, "values") else list(getattr(dn, "definedName", []))
-    for ws in wb.worksheets:  # nomes com escopo de aba (openpyxl 3.1+)
+    for ws in ([] if globais else wb.worksheets):  # nomes com escopo de aba (openpyxl 3.1+)
         lista.extend(getattr(ws, "defined_names", {}).values())
-    return ["%s = %s" % (d.name, d.attr_text) for d in lista]
+    return lista
 
 
-def converter(fonte):
-    """Retorna (texto, numeros). fonte = caminho ou arquivo aberto."""
-    if hasattr(fonte, "seek"):
-        fonte.seek(0)
-    wb = load_workbook(fonte)
-    if hasattr(fonte, "seek"):
-        fonte.seek(0)
-    wb_v = load_workbook(fonte, read_only=True, data_only=True)
+RE_TABELA = re.compile(r"^([^\[\]]*)\[(.*)\]$")
 
-    avisos, mapa, corpo = [], [], []
-    bruto_chars = 0  # tamanho do dump celula a celula (so para a comparacao)
-    falhas, total_formulas, sem_cache = [], 0, True
-    ja_vistas = []  # (nome, esperado) das abas anteriores
-    s_form = s_dados = 0
 
+def parte_aba(texto):
+    """"'P 1'!A1" -> ("P 1", "A1"); "A1" -> (None, "A1")."""
+    aba, sep, resto = texto.rpartition("!")
+    if not sep:
+        return None, texto
+    if len(aba) > 1 and aba[0] == aba[-1] == "'":
+        aba = aba[1:-1].replace("''", "'")
+    return aba, resto
+
+
+def acha_alvo(wb, texto):
+    """'Aba'!B5 / Aba!B5 / B5 (aba ativa) -> (titulo, linha, coluna). ValueError se nao der."""
+    aba, cel = parte_aba(texto.strip())
+    m = PECA_CELULA.match(cel.upper())
+    if not m or column_index_from_string(m.group(2)) > 16384:
+        raise ValueError("celula invalida: %s (use Aba!B5, uma celula so)" % texto)
+    nomes = {ws.title.lower(): ws.title for ws in wb.worksheets}
+    titulo = wb.active.title if aba is None else nomes.get(aba.lower())
+    if titulo is None:
+        raise ValueError("aba nao encontrada: %s" % aba)
+    return titulo, int(m.group(4)), column_index_from_string(m.group(2))
+
+
+def faixa(texto):
+    """'A1:B9', 'A:A', '2:2', 'B5' -> (r1, c1, r2, c2), None = sem limite. None se nao for faixa."""
+    partes = texto.upper().split(":")
+    if len(partes) == 1:  # sozinho so vale celula: "TIR" e nome, nao a coluna TIR
+        if not PECA_CELULA.match(partes[0]):
+            return None
+        partes = partes * 2
+    if len(partes) != 2:
+        return None
+    (a, b) = partes
+    ma, mb = PECA_CELULA.match(a), PECA_CELULA.match(b)
+    if ma and mb:
+        r1, r2 = sorted((int(ma.group(4)), int(mb.group(4))))
+        c1, c2 = sorted((column_index_from_string(ma.group(2)), column_index_from_string(mb.group(2))))
+        return r1, c1, r2, c2
+    ma, mb = PECA_COLUNA.match(a), PECA_COLUNA.match(b)
+    if ma and mb:
+        c1, c2 = sorted((column_index_from_string(ma.group(2)), column_index_from_string(mb.group(2))))
+        return None, c1, None, c2
+    ma, mb = PECA_LINHA.match(a), PECA_LINHA.match(b)
+    if ma and mb:
+        r1, r2 = sorted((int(ma.group(2)), int(mb.group(2))))
+        return r1, None, r2, None
+    return None
+
+
+def precedentes(wb, dados, alvo):
+    """Celulas de que alvo depende, recursivo entre abas.
+    dados = {aba: (formulas, valores)}. Retorna ({aba: set(pos)}, avisos, nomes usados)."""
+    abas = {t.lower(): t for t in dados}
+    indice, matrizes, tabelas = {}, defaultdict(list), {}
+    for aba, (formulas, valores) in dados.items():
+        cols = defaultdict(list)
+        for (r, c) in set(formulas) | set(valores):
+            cols[c].append(r)
+        indice[aba] = {c: sorted(rs) for c, rs in cols.items()}
+        for (r, c), f in formulas.items():
+            if f[0] == "a":
+                r1, c1, r2, c2 = faixa(f[2])
+                matrizes[aba].append((r1, c1, r2, c2, (r, c)))
+    for ws in wb.worksheets:
+        for t in ws.tables.values():
+            r1, c1, r2, c2 = faixa(t.ref)
+            cab = 1 if t.headerRowCount is None else t.headerRowCount
+            tabelas[t.displayName.lower()] = (ws.title, r1 + cab, c1, r2, c2,
+                                              [col.name.lower() for col in t.tableColumns])
+    nomes = {(None, d.name.lower()): (d.name, d.attr_text) for d in _nomes(wb, globais=True)}
+    for ws in wb.worksheets:  # nome com escopo de aba ganha do global nessa aba
+        for d in getattr(ws, "defined_names", {}).values():
+            nomes[(ws.title, d.name.lower())] = (d.name, d.attr_text)
+    avisos, exemplo, usados = Counter(), {}, set()
+
+    def celulas(aba, r1, c1, r2, c2):
+        for c, linhas in indice[aba].items():
+            if c1 is not None and not c1 <= c <= c2:
+                continue
+            ini = 0 if r1 is None else bisect.bisect_left(linhas, r1)
+            fim = len(linhas) if r2 is None else bisect.bisect_right(linhas, r2)
+            for r in linhas[ini:fim]:
+                yield (aba, r, c)
+        for a1, b1, a2, b2, ancora in matrizes[aba]:
+            if (r1 is None or (a1 <= r2 and r1 <= a2)) and (c1 is None or (b1 <= c2 and c1 <= b2)):
+                yield (aba, ancora[0], ancora[1])
+
+    def tabela(nome, dentro, aqui, pos):
+        if nome:
+            t = tabelas.get(nome.lower())
+        else:  # [@Col]: tabela que contem a propria celula
+            t = next((t for t in tabelas.values() if t[0] == aqui
+                      and t[1] - 1 <= pos[0] <= t[3] and t[2] <= pos[1] <= t[4]), None)
+        if t is None:
+            return None
+        aba, r1, c1, r2, c2, cols = t
+        pedidas = [x.strip().lstrip("@").lower() for x in re.split(r"[\[\],:]", dentro)]
+        achadas = [c1 + cols.index(x) for x in pedidas if x in cols]
+        if achadas:
+            c1, c2 = min(achadas), max(achadas)
+        return list(celulas(aba, r1, c1, r2, c2))
+
+    def resolve(v, aqui, pos, abertos=()):
+        """Operando de formula -> lista de celulas, ou None se nao der para seguir."""
+        if re.match(r"^'?\[\d+\]", v):
+            avisos[(aqui, "external file reference (not followed)")] += 1
+            return []
+        m = RE_TABELA.match(v)
+        if m and "!" not in v:
+            return tabela(m.group(1), m.group(2), aqui, pos)
+        aba, alvo_txt = parte_aba(v)
+        f = faixa(alvo_txt)
+        if f is not None:
+            aba = aqui if aba is None else abas.get(aba.lower())
+            return None if aba is None else list(celulas(aba, *f))
+        achado = nomes.get((aqui, v.lower())) or nomes.get((None, v.lower())) if aba is None else None
+        if achado:
+            nome, destino = achado
+            usados.add(nome.lower())
+            if "(" in destino or v.lower() in abertos:  # formula ou nome circular
+                return None
+            if re.match(r'^=?\s*(-?[\d.]+(E[+-]?\d+)?%?|".*"|TRUE|FALSE)\s*$', destino, re.I):
+                return []  # constante (Taxa = 0.05): nada para seguir
+            saida = []
+            for parte in destino.split(","):
+                achou = resolve(parte.strip(), aqui, pos, abertos + (v.lower(),))
+                if achou is None:
+                    return None
+                saida += achou
+            return saida
+        if aba is None and v.lower() in tabelas:
+            return tabela(v, "", aqui, pos)
+        return None
+
+    memo = {}
+    fila, vistos = list(celulas(*alvo[:1] + (alvo[1], alvo[2], alvo[1], alvo[2]))) or [alvo], set()
+    while fila:
+        k = fila.pop()
+        if k in vistos:
+            continue
+        vistos.add(k)
+        f = dados[k[0]][0].get(k[1:])
+        if not f or f[0] == "d":
+            continue
+        try:
+            itens = Tokenizer(f[1]).items
+        except Exception:  # ex.: B1# (spill) o Tokenizer nao entende
+            chave = (k[0], "formula not parsed, refs not followed")
+            avisos[chave] += 1
+            exemplo.setdefault(chave, ref(*k[1:]))
+            continue
+        for t in itens:
+            if t.type == Token.OPERAND and t.subtype == Token.RANGE:
+                chave_memo = (t.value, k[0])
+                if "[" in t.value:  # [@Col] depende da linha: sem cache
+                    achou = resolve(t.value, k[0], k[1:])
+                elif chave_memo in memo:
+                    achou = memo[chave_memo]
+                else:
+                    achou = memo[chave_memo] = resolve(t.value, k[0], k[1:])
+                if achou is None:
+                    chave = (k[0], "unresolved reference %s" % t.value)
+                    avisos[chave] += 1
+                    exemplo.setdefault(chave, ref(*k[1:]))
+                else:
+                    fila.extend(x for x in achou if x not in vistos)
+    cadeia = defaultdict(set)
+    for aba, r, c in vistos:
+        cadeia[aba].add((r, c))
+    linhas = ["- '%s': %s%s%s" % (aba, txt, " in %s" % exemplo[(aba, txt)] if (aba, txt) in exemplo else "",
+                                   " (x%d)" % n if n > 1 else "") for (aba, txt), n in sorted(avisos.items())]
+    return cadeia, linhas, usados
+
+
+def ler_abas(wb, wb_v):
+    """[(aba, formulas, valores, cache)], tamanho do dump celula a celula, True se nenhuma formula tem valor salvo."""
+    abas, bruto_chars, sem_cache = [], 0, True
     for ws in wb.worksheets:
         cache = {}
         for linha in wb_v[ws.title].iter_rows():
@@ -426,6 +612,41 @@ def converter(fonte):
                                                       cache.get(pos))) + 1
         if any(pos in cache for pos in formulas):
             sem_cache = False
+        abas.append((ws, formulas, valores, cache))
+
+    return abas, bruto_chars, sem_cache
+
+
+def converter(fonte, alvo=None):
+    """Retorna (texto, numeros). fonte = caminho ou arquivo aberto.
+    alvo = "Aba!B5": so a cadeia de precedentes dessa celula."""
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    wb = load_workbook(fonte)
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    wb_v = load_workbook(fonte, read_only=True, data_only=True)
+
+    avisos, mapa, corpo = [], [], []
+    falhas, total_formulas = [], 0
+    ja_vistas = []  # (nome, esperado) das abas anteriores
+    s_form = s_dados = 0
+
+    abas, bruto_chars, sem_cache = ler_abas(wb, wb_v)
+
+    cadeia, contexto, todas = None, None, 0
+    if alvo is not None:
+        alvo_pos = acha_alvo(wb, alvo)
+        todas = sum(1 for _, fs, _, _ in abas for f in fs.values() if f[0] in "fa")
+        cadeia, avisos_cadeia, usados = precedentes(wb, {ws.title: (f, v) for ws, f, v, _ in abas}, alvo_pos)
+    for ws, formulas, valores, cache in abas:
+        if cadeia is not None:
+            meus = cadeia.get(ws.title)
+            if not meus:
+                continue
+            contexto = (formulas, valores)  # rotulos olham a aba inteira
+            formulas = {p: f for p, f in formulas.items() if p in meus}
+            valores = {p: v for p, v in valores.items() if p in meus}
 
         textos = [f[1] for f in formulas.values() if f[0] in "fa"]
         total_formulas += len(textos)
@@ -470,7 +691,7 @@ def converter(fonte):
             mapa.append("  table %s %s columns: %s" % (t.displayName, t.ref, ", ".join(colunas)))
 
         # formulas
-        linhas_f = secao_formulas(formulas, valores)
+        linhas_f = secao_formulas(formulas, valores, "blank" if cadeia is None else "not in chain", contexto, cache)
         if not confere(linhas_f, meu):
             falhas.append(ws.title)
             linhas_f = por_celula(formulas)
@@ -503,6 +724,9 @@ def converter(fonte):
         avisos.insert(0, "- WARNING: compact view failed the self-check on %d sheet(s): %s. "
                          "Those sheets list one formula per cell." % (len(falhas), ", ".join(falhas)))
     nomes = nomes_definidos(wb)
+    if cadeia is not None:
+        avisos += avisos_cadeia
+        nomes = [n for n in nomes if n.split(" = ")[0].lower() in usados]
     if nomes:
         mapa += ["Defined names:"] + ["  " + n for n in nomes]
 
@@ -511,9 +735,19 @@ def converter(fonte):
         "How to read formulas: '<range> <formula>' gives the formula of the first cell;",
         "the rest of the range is the same formula copied (Excel fill), refs shifting as usual.",
         "'[label]' after the range is the nearest text header (above a column, left of a row): a hint, not part of the formula.",
+        "'(v X)' is the value Excel last calculated for the first cell of the range: a hint, not part of the formula.",
         "'except <cell> ...' overrides one cell inside the range above it.",
         "'same formulas as X' means the sheet is a copy of X except the listed cells.",
     ]
+    if cadeia is not None:
+        aba, r, c = alvo_pos
+        valor = next(cc for w, _, _, cc in abas if w.title == aba).get((r, c))
+        cabeca += [
+            "Precedents of '%s'!%s (cached value: %s): only the %d cells it depends on, in %d sheet(s)%s."
+            % (aba, ref(r, c), "none" if valor is None else fmt(valor), sum(map(len, cadeia.values())), len(cadeia),
+               "; some refs could not be followed, see Warnings" if avisos_cadeia else ""),
+            "'except <cell> not in chain' = that cell is not used by the target.",
+        ]
     texto_avisos = ["", "## Warnings"] + (avisos or ["- none"])
     texto_mapa = ["", "## Map"] + mapa
     texto = "\n".join(cabeca + texto_avisos + texto_mapa + corpo) + "\n"
@@ -525,21 +759,158 @@ def converter(fonte):
         "formulas": s_form,
         "dados": s_dados,
         "total_formulas": total_formulas,
+        "todas_formulas": todas,
         "falhas": len(falhas),
     }
     return texto, numeros
 
 
-def main(caminho):
+LIMITE_CONSTANTES = 200  # linhas de constantes por aba no --diff
+
+
+def _igual(a, b):
+    """Mesmo valor (ruido de ponto flutuante abaixo de 1e-9 nao conta)."""
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) and not isinstance(b, bool):
+        return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
+    return fmt(a) == fmt(b)
+
+
+def _abrir(fonte):
+    """(wb, abas) de uma planilha, para o --diff."""
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    wb = load_workbook(fonte)
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    wb_v = load_workbook(fonte, read_only=True, data_only=True)
+    abas = ler_abas(wb, wb_v)[0]
+    wb_v.close()
+    return wb, {ws.title: (formulas, valores, cache) for ws, formulas, valores, cache in abas}
+
+
+def _secao_diff(titulo, formulas, contexto, cache, falhas, aba):
+    """Bloco compacto de um conjunto de formulas, com a conferencia de sempre."""
+    if not formulas:
+        return []
+    linhas = secao_formulas(formulas, {}, "unchanged", contexto, cache)
+    if not confere(linhas, esperado(formulas)):
+        falhas.append("%s (%s)" % (aba, titulo))
+        linhas = por_celula(formulas)
+    return ["## " + titulo] + linhas
+
+
+def converter_diff(antiga, nova):
+    """Retorna (texto, numeros): so o que mudou da planilha antiga para a nova."""
+    wb_a, abas_a = _abrir(antiga)
+    wb_n, abas_n = _abrir(nova)
+    falhas, corpo, resumo = [], [], []
+    n_mudou = n_antes = n_const = n_iguais = 0
+    vazio = ({}, {}, {})
+
+    for nome in list(abas_n) + [t for t in abas_a if t not in abas_n]:
+        if nome not in abas_a or nome not in abas_n:
+            fs = (abas_n if nome in abas_n else abas_a)[nome][0]
+            qtd = sum(1 for f in fs.values() if f[0] in "fa")
+            resumo.append("- sheet '%s' %s (%d formulas)" % (nome, "added" if nome in abas_n else "removed", qtd))
+            continue
+        fa, va, ca = abas_a[nome]
+        fn, vn, cn = abas_n[nome]
+        ea, en = esperado(fa), esperado(fn)
+        mudou = {pos: f for pos, f in fn.items() if f[0] in "fa" and ea.get(ref(*pos)) != en[ref(*pos)]}
+        antes = {pos: f for pos, f in fa.items() if f[0] in "fa" and en.get(ref(*pos)) != ea[ref(*pos)]}
+        const = []
+        va = {q: x for q, x in va.items() if not (isinstance(x, str) and not x.strip())}  # "" = vazio
+        vn = {q: x for q, x in vn.items() if not (isinstance(x, str) and not x.strip())}
+        for pos in sorted(set(va) | set(vn)):
+            a, n = va.get(pos), vn.get(pos)
+            if pos in va and pos in vn:
+                if not _igual(a, n):
+                    const.append("%s %s -> %s" % (ref(*pos), fmt(a), fmt(n)))
+            elif pos in vn:
+                const.append("%s added %s" % (ref(*pos), fmt(n)))
+            else:
+                const.append("%s removed (was %s)" % (ref(*pos), fmt(a)))
+        if not (mudou or antes or const):
+            n_iguais += 1
+            continue
+        n_mudou += len(mudou)
+        n_antes += len(antes)
+        n_const += len(const)
+        bloco = ["", "# Sheet '%s'" % nome]
+        bloco += _secao_diff("Formulas new or changed", mudou, (fn, vn), cn, falhas, nome)
+        bloco += _secao_diff("Formulas before (changed or removed cells)", antes, (fa, va), ca, falhas, nome)
+        if const:
+            extra = len(const) - LIMITE_CONSTANTES
+            bloco += ["## Constants"] + const[:LIMITE_CONSTANTES] + (["... %d more" % extra] if extra > 0 else [])
+        corpo += bloco
+
+    nomes_a, nomes_n = set(nomes_definidos(wb_a)), set(nomes_definidos(wb_n))  # "NOME = destino"; destino novo = removido + novo
+    nomes = ["removed: " + n for n in sorted(nomes_a - nomes_n)] + ["added: " + n for n in sorted(nomes_n - nomes_a)]
+
+    cabeca = [
+        "# excel_ai diff (old -> new)",
+        "Only what changed. '## Formulas new or changed' is the NEW version, same format as the normal dump",
+        "('<range> [label] (v value) <formula>', 'except' = cell inside the range that did not change).",
+        "'## Formulas before' is the OLD formula of the cells that changed or disappeared.",
+        "'A1 old -> new' is a constant that changed.",
+        "Summary: %d formulas new or changed, %d old formulas replaced or removed, %d constants changed, %d sheet(s) without changes."
+        % (n_mudou, n_antes, n_const, n_iguais),
+    ]
+    if falhas:
+        cabeca.append("WARNING: compact view failed the self-check in: %s. Those parts list one formula per cell." % ", ".join(falhas))
+    if resumo:
+        cabeca += ["", "## Sheets"] + resumo
+    if nomes:
+        cabeca += ["", "## Defined names"] + nomes
+    if not (corpo or resumo or nomes):
+        cabeca.append("No changes found.")
+    texto = "\n".join(cabeca + corpo) + "\n"
+    return texto, {"novo": tokens(texto), "formulas": n_mudou, "antes": n_antes, "constantes": n_const,
+                   "falhas": len(falhas)}
+
+
+def main_diff(antiga, nova):
+    for caminho in (antiga, nova):
+        if not os.path.isfile(caminho):
+            sys.stderr.write("erro: arquivo nao encontrado: %s\n" % ascii(caminho))
+            return 2
+    try:
+        texto, n = converter_diff(antiga, nova)
+    except Exception as e:
+        sys.stderr.write("erro: nao consegui ler a planilha (%s: %s)\n" % (type(e).__name__, ascii(str(e))))
+        return 2
+    limpo = lambda c: re.sub(r"[^A-Za-z0-9]", "_", os.path.splitext(os.path.basename(c))[0])
+    destino = os.path.join(os.path.dirname(os.path.abspath(nova)), "%s.vs_%s.diff.ai.txt" % (limpo(nova), limpo(antiga)))
+    with io.open(destino, "w", encoding="utf-8", newline="\n") as arq:
+        arq.write(texto)
+    print("Tokens do diff:  %10s" % "{:,}".format(n["novo"]))
+    print("Formulas novas/mudadas: %s | antigas trocadas/removidas: %s | constantes: %s" % (
+        n["formulas"], n["antes"], n["constantes"]))
+    if n["falhas"]:
+        print("Conferencia das formulas: FALHOU em %d parte(s); elas sairam celula a celula." % n["falhas"])
+    else:
+        print("Conferencia das formulas: 100%%")
+    print("Arquivo gerado: %s" % os.path.basename(destino).encode("ascii", "backslashreplace").decode())
+    return 1 if n["falhas"] else 0
+
+
+def main(caminho, alvo=None):
     if not os.path.isfile(caminho):
         sys.stderr.write("erro: arquivo nao encontrado: %s\n" % ascii(caminho))
         return 2
     try:
-        texto, n = converter(caminho)
+        texto, n = converter(caminho, alvo)
+    except ValueError as e:
+        sys.stderr.write("erro: %s\n" % ascii(str(e)))
+        return 2
     except Exception as e:
         sys.stderr.write("erro: nao consegui ler a planilha (%s: %s)\n" % (type(e).__name__, ascii(str(e))))
         return 2
-    destino = os.path.splitext(caminho)[0] + ".ai.txt"
+    sufixo = ""
+    if alvo is not None:
+        aba, cel = parte_aba(alvo.strip())
+        sufixo = "." + re.sub(r"[^A-Za-z0-9]", "_", "%s_%s" % (aba or "ativa", cel.replace("$", "").upper()))
+    destino = os.path.splitext(caminho)[0] + sufixo + ".ai.txt"
     with io.open(destino, "w", encoding="utf-8", newline="\n") as arq:
         arq.write(texto)
     print("Tokens hoje (celula a celula): %10s" % "{:,}".format(n["bruto"]))
@@ -548,12 +919,32 @@ def main(caminho):
         "{:,}".format(n[k]) for k in ("avisos", "mapa", "formulas", "dados")))
     if n["novo"]:
         print("Reducao: %.1fx" % (n["bruto"] / float(n["novo"])))
+    if alvo is not None:
+        print("Cadeia: %s de %s formulas da planilha (%.1f%%)" % (
+            "{:,}".format(n["total_formulas"]), "{:,}".format(n["todas_formulas"]),
+            100.0 * n["total_formulas"] / max(n["todas_formulas"], 1)))
     if n["falhas"]:
         print("Conferencia das formulas: FALHOU em %d aba(s); essas abas sairam celula a celula." % n["falhas"])
     else:
         print("Conferencia das formulas: 100%% (%s formulas sem perda)" % "{:,}".format(n["total_formulas"]))
     print("Arquivo gerado: %s" % os.path.basename(destino).encode("ascii", "backslashreplace").decode())
     return 1 if n["falhas"] else 0
+
+
+def main_pasta(pasta):
+    """Converte cada planilha da pasta com main(); um arquivo ruim nao para os outros."""
+    nomes = sorted(n for n in os.listdir(pasta)
+                   if n.lower().endswith((".xlsx", ".xlsm")) and not n.startswith("~$")
+                   and os.path.isfile(os.path.join(pasta, n)))
+    if not nomes:
+        sys.stderr.write("erro: nenhuma planilha .xlsx/.xlsm na pasta: %s\n" % ascii(pasta))
+        return 2
+    codigos = []
+    for n in nomes:
+        print("== %s ==" % n.encode("ascii", "backslashreplace").decode())
+        codigos.append(main(os.path.join(pasta, n)))
+    print("Pasta: %d planilha(s), %d com problema" % (len(nomes), sum(1 for c in codigos if c)))
+    return max(codigos)
 
 
 def _fixture():
@@ -691,6 +1082,25 @@ def autoteste():
     assert blocos(um, {(3, 3): "TIR"}, True) == ["C4 [TIR] =A1"]  # nada a esquerda: olha acima
     assert blocos(um, {(4, 2): "Taxa", (3, 3): "TIR"}, True) == ["C4 [Taxa] =A1"]  # esquerda ganha
     assert expandir(["B5:B7 [Juros] =A5"]) == expandir(["B5:B7 =A5"])
+
+    # valor calculado: so o 1o da faixa, depois do rotulo; sem cache ou None = sem dica
+    fs = {(r, 2): ("f", "=A%d" % r, relativa("=A%d" % r, r, 2)) for r in range(5, 8)}
+    assert blocos(fs, {(4, 2): "Juros"}, True, cache={(5, 2): 12.5, (6, 2): 99})[0] == "B5:B7 [Juros] (v 12.5) =A5"
+    assert blocos(fs, {}, True, cache={(5, 2): 3})[0] == "B5:B7 (v 3) =A5"
+    assert blocos({(5, 2): fs[(5, 2)]}, {}, True, cache={(5, 2): 3})[0] == "B5 =A5"  # celula sozinha: sem dica
+    assert blocos(fs, {}, True, cache={(6, 2): 3})[0] == "B5:B7 =A5"  # 1a celula sem valor
+    assert blocos(fs, {}, True, cache={(5, 2): None})[0] == "B5:B7 =A5"
+    assert blocos(fs, {}, True, cache={(5, 2): "a)b\nc  " + "x" * 30})[0] == "B5:B7 (v ab c xxxxxxxxxxxxxxx) =A5"
+    assert blocos(fs, {}, True, cache={(5, 2): "#N/A"})[0] == "B5:B7 (v #N/A) =A5"
+    assert blocos(fs, {}, True, cache={(5, 2): True})[0] == "B5:B7 (v TRUE) =A5"
+    assert blocos(fs, {}, True)[0] == "B5:B7 =A5"
+    fx = dict(fs)
+    fx[(6, 2)] = ("f", "=Z1", relativa("=Z1", 6, 2))
+    assert not any("(v" in l for l in blocos(fx, {}, True, cache={(5, 2): 1, (6, 2): 2}) if l.startswith("  except"))
+    assert expandir(["B5:B7 [Juros] (v 12.5) =A5"]) == expandir(["B5:B7 =A5"])
+    assert expandir(["B5 (v 1) =A5"]) == {"B5": "=A5"}
+    assert not confere(["B5:B7 (v 1) =A5"], {"B5": "=A5", "B6": "=A6", "B7": "=A8"})
+    assert not confere(["B5:B7 (v 1 =A5"], {"B5": "=A5", "B6": "=A6", "B7": "=A7"})
     certo = {"D%d" % r: "=B%d*C%d" % (r, r) for r in range(2, 11)}
     assert confere(["D2:D10 [J] =B2*C2"], certo) and not confere(["D2:D10 [J] =B2*C3"], certo)
     assert not confere(["D2:D10 [J =B2*C2"], certo)  # rotulo mal fechado nao passa
@@ -747,6 +1157,199 @@ def autoteste():
     # Translator do openpyxl apagava ABA!#REF!; tradutor() protege
     assert tradutor("=XLOOKUP(A2,Base!#REF!,'P 1'!#REF!)+#REF!", "B2")("B3") == "=XLOOKUP(A3,Base!#REF!,'P 1'!#REF!)+#REF!"
 
+    # cadeia de precedentes (--celula): so o que a celula usa, entre abas
+    texto, n = converter(_fixture(), "Fluxo!D5")
+    assert "Precedents of 'Fluxo'!D5" in texto, texto[:400]
+    fl = texto.split("# Sheet 'Fluxo'")[1].split("# Sheet ")[0]
+    assert "D5 =B5*C5" in fl and "B5 =Premissas!$B$2-A5" in fl and "C5 =XLOOKUP(" in fl, fl
+    assert "D6" not in fl and "Meses" not in texto and "Fluxo B" not in texto
+    assert "A3 Carencia | B3 6" in texto  # coluna inteira do XLOOKUP entra
+    assert n["falhas"] == 0 and n["total_formulas"] == 3
+    texto, n = converter(_fixture(), "fluxo!$j$2")  # nome definido + outra aba
+    assert "TAXA2024 = Premissas!$B$1" in texto and "A1 Nome" in texto and "B1 0.012" in texto
+    texto, n = converter(_fixture(), "Fluxo!I2")  # tabela: so a coluna Valor
+    extra = texto.split("# Sheet 'Plan Extra 2'")[1]
+    assert "B2" in extra and "item0" not in extra, extra
+    for ruim in ("Nada!A1", "Fluxo!A1:B2", "Fluxo!ZZZZ1"):
+        try:
+            converter(_fixture(), ruim)
+            assert False, ruim
+        except ValueError:
+            pass
+    from openpyxl.worksheet.table import Table
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S"
+    ws["A1"] = "Valor"
+    for r in range(2, 13):
+        ws["A%d" % r], ws["B%d" % r] = "=B%d*2" % r, r
+    w2 = wb.create_sheet("T2")
+    w2["D1"], w2["E1"] = "=E1", "=D1"  # ciclo
+    w2["F1"], w2["G1"] = "=Nope!A1", '=INDIRECT("A1")'
+    w2["H1"] = ArrayFormula("H1:H3", "=B2:B4*2")
+    w2["I1"] = "=H2"  # meio da matriz puxa a ancora
+    w2["K1"], w2["L1"], w2["K2"], w2["K3"] = "Qtd", "Dobro", 7, 8
+    w2["L2"], w2["L3"] = "=[@Qtd]*2", "=[@Qtd]*2"
+    w2.add_table(Table(displayName="T", ref="K1:L3"))
+    from openpyxl.workbook.defined_name import DefinedName
+    try:
+        wb.defined_names.add(DefinedName("LOOP", attr_text="LOOP"))  # nome que aponta para si
+    except AttributeError:
+        wb.defined_names.append(DefinedName("LOOP", attr_text="LOOP"))
+    ws["C1"] = "=SUM(A2:A3)+SUM(A5:A12)+T2!D1+T2!F1+T2!G1+T2!I1+T2!L2+LOOP"
+    buf = io.BytesIO()
+    wb.save(buf)
+    texto, n = converter(buf, "C1")
+    assert "A2:A12 [Valor] =B2*2" in texto and "  except A4 not in chain" in texto, texto
+    assert "D1 =E1" in texto and "E1 =D1" in texto and "H1 array H1:H3" in texto
+    assert "- 'T2': unresolved reference Nope!A1 in F1" in texto and "unresolved reference LOOP" in texto and "OFFSET/INDIRECT" in texto
+    assert "K2 7" in texto and "L3 =" not in texto and n["falhas"] == 0
+    # nome curto nao e coluna; nome de aba ganha do global; constante nao avisa; B1# avisa; meio de matriz
+    wb = Workbook()
+    s1, s2 = wb.active, wb.create_sheet("S2")
+    s1.title = "S1"
+    s1["Z1"], s2["A1"], s2["B1"] = 5, 1, 100
+    for nome, texto in (("TIR", "S1!$Z$1"), ("Rate", "S2!$B$1"), ("Taxa", "0.05")):
+        try:
+            wb.defined_names.add(DefinedName(nome, attr_text=texto))
+        except AttributeError:
+            wb.defined_names.append(DefinedName(nome, attr_text=texto))
+    try:
+        s1.defined_names.add(DefinedName("Rate", attr_text="S2!$A$1"))
+    except AttributeError:
+        s1.defined_names["Rate"] = DefinedName("Rate", attr_text="S2!$A$1")
+    s1["A1"] = "=TIR*Rate*Taxa+C1"
+    s1["C1"] = "=SUM(D1#)"
+    s1["E1"] = ArrayFormula("E1:E2", "=Z1:Z2*2")
+    buf = io.BytesIO()
+    wb.save(buf)
+    texto, n = converter(buf, "S1!A1")
+    assert "Z1 5" in texto and "A1 1" in texto and "B1 100" not in texto, texto
+    assert "unresolved" not in texto and "formula not parsed" in texto and "see Warnings" in texto
+    texto, n = converter(buf, "S1!E2")
+    assert "E1 array E1:E2" in texto
+    import subprocess
+    uso = subprocess.run([sys.executable, os.path.abspath(__file__), caminho, "--celula", "Fluxo!D5"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert uso.returncode == 0 and b"Cadeia: 3 de 618 formulas" in uso.stdout, uso.stdout
+    uso = subprocess.run([sys.executable, os.path.abspath(__file__), caminho, "x", "y"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert uso.returncode == 2 and b"uso:" in uso.stderr
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        assert main(caminho, "'Fluxo'!D5") == 0
+        assert os.path.isfile(os.path.join(pasta, "fix.Fluxo_D5.ai.txt"))
+        assert main(caminho, "Nada!A1") == 2
+
+    # --diff: duas versoes
+    from openpyxl.workbook.defined_name import DefinedName as DN
+
+    def livro(edita=None):
+        w = Workbook()
+        a = w.active
+        a.title = "S"
+        a["A1"], a["B1"] = "Item", "Valor"
+        for r in range(2, 12):
+            a["A%d" % r] = "x%d" % r
+            a["B%d" % r] = r
+            a["C%d" % r] = "=B%d*2" % r
+        a["D1"] = "=SUM(C2:C11)"
+        w.create_sheet("T")["A1"] = "=S!D1"
+        w.defined_names["Taxa"] = DN("Taxa", attr_text="S!$B$2")
+        if edita:
+            edita(w)
+        b = io.BytesIO()
+        w.save(b)
+        return b
+
+    velho = livro()
+    texto, n = converter_diff(velho, livro())
+    assert "No changes found." in texto and n["formulas"] == n["antes"] == n["constantes"] == 0 and n["falhas"] == 0, texto
+
+    def v2(w):
+        a = w["S"]
+        for r in range(5, 9):
+            a["C%d" % r] = "=B%d*3" % r  # bloco de 4 mudou
+        a["C11"] = 7  # formula virou constante
+        a["B2"] = 99  # constante mudou
+        a["E1"] = "novo"  # constante nova
+        a["A3"] = None  # constante removida
+        w["T"]["A1"] = "=S!D1+1"
+        w.create_sheet("U")["A1"] = "=1+1"
+        del w["S"].parent.defined_names["Taxa"]
+        w.defined_names["Outra"] = DN("Outra", attr_text="S!$B$3")
+
+    texto, n = converter_diff(velho, livro(v2))
+    assert n["falhas"] == 0, texto
+    assert "C5:C8 =B5*3" in texto and "C5:C8 =B5*2" in texto, texto  # novo e antigo
+    assert "C11 =B11*2" in texto and "C11 7" not in texto.split("## Constants")[0]
+    assert "B2 2 -> 99" in texto and "E1 added novo" in texto and "A3 removed (was x3)" in texto and "C11 added 7" in texto, texto
+    assert "A1 =S!D1+1" in texto and "A1 =S!D1\n" in texto
+    assert "- sheet 'U' added (1 formulas)" in texto
+    assert "removed: Taxa = S!$B$2" in texto and "added: Outra = S!$B$3" in texto, texto
+    assert "C2:C4" not in texto and "SUM" not in texto  # o que nao mudou fica de fora
+    assert n["formulas"] == 5 and n["antes"] == 6 and n["constantes"] == 4, n
+    # preencher para baixo igual nao e mudanca (mesma formula relativa)
+    texto, n = converter_diff(velho, livro(lambda w: w["S"].__setitem__("C2", "=B2*2")))
+    assert "No changes found." in texto
+    # ruido: "" vira vazio, float em 1e-12 nao conta
+    def ruido(w):
+        w["S"]["F1"] = ""
+        w["S"]["B3"] = 3.0000000000001
+    texto, n = converter_diff(velho, livro(ruido))
+    assert "No changes found." in texto, texto
+    # mais de 200 constantes: corta
+    def muitas(w):
+        for r in range(1, 301):
+            w["T"]["B%d" % r] = r
+    texto, n = converter_diff(velho, livro(muitas))
+    assert "... 100 more" in texto and texto.count("added") == 200 and n["constantes"] == 300
+    # conferencia que falha cai para uma linha por celula
+    guarda = confere
+    globals()["confere"] = lambda linhas, meu, base=None: False
+    try:
+        texto, n = converter_diff(velho, livro(v2))
+    finally:
+        globals()["confere"] = guarda
+    assert n["falhas"] > 0 and "WARNING: compact view failed" in texto and "C5 =B5*3" in texto, texto
+    # CLI
+    pa, pn = os.path.join(pasta, "old v1.xlsx"), os.path.join(pasta, "new v2.xlsx")
+    for caminho_x, b in ((pa, velho), (pn, livro(v2))):
+        with open(caminho_x, "wb") as arq:
+            arq.write(b.getvalue())
+    uso = subprocess.run([sys.executable, os.path.abspath(__file__), pa, pn, "--diff"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert uso.returncode == 0 and b"100%" in uso.stdout, uso.stdout + uso.stderr
+    assert os.path.isfile(os.path.join(pasta, "new_v2.vs_old_v1.diff.ai.txt"))
+    uso = subprocess.run([sys.executable, os.path.abspath(__file__), pa, os.path.join(pasta, "nada.xlsx"), "--diff"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert uso.returncode == 2
+    uso = subprocess.run([sys.executable, os.path.abspath(__file__), pa, pn, "--celula"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert uso.returncode == 2 and b"uso:" in uso.stderr
+
+    # pasta inteira
+    sub = os.path.join(pasta, "lote")
+    os.makedirs(os.path.join(sub, "fundo"))
+    for nome_x in ("b.xlsx", "a.XLSM", os.path.join("fundo", "c.xlsx")):
+        with open(os.path.join(sub, nome_x), "wb") as arq:
+            arq.write(_fixture().getvalue())
+    for nome_x in ("~$a.xlsx", "ruim.xlsx", "nota.txt"):
+        with open(os.path.join(sub, nome_x), "wb") as arq:
+            arq.write(b"nao e planilha")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        assert main_pasta(sub) == 2
+    assert os.path.isfile(os.path.join(sub, "a.ai.txt")) and os.path.isfile(os.path.join(sub, "b.ai.txt"))
+    assert not os.path.exists(os.path.join(sub, "ruim.ai.txt")) and not os.path.exists(os.path.join(sub, "fundo", "c.ai.txt"))
+    assert "Pasta: 3 planilha(s), 1 com problema" in out.getvalue() and "== a.XLSM ==" in out.getvalue(), out.getvalue()
+    vazia = os.path.join(pasta, "vazia")
+    os.makedirs(vazia)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        assert main_pasta(vazia) == 2
+    uso = subprocess.run([sys.executable, os.path.abspath(__file__), os.path.join(sub, "fundo")],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert uso.returncode == 0 and b"Pasta: 1 planilha(s), 0 com problema" in uso.stdout, uso.stdout
+
     # macro: zip com vbaProject.bin
     z = io.BytesIO()
     with zipfile.ZipFile(z, "w") as arq:
@@ -756,6 +1359,13 @@ def autoteste():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[2] == "--celula":
+        sys.exit(main(sys.argv[1], sys.argv[3]))
+    if len(sys.argv) == 4 and sys.argv[3] == "--diff":
+        sys.exit(main_diff(sys.argv[1], sys.argv[2]))
+    if len(sys.argv) == 2:
+        sys.exit(main_pasta(sys.argv[1]) if os.path.isdir(sys.argv[1]) else main(sys.argv[1]))
     if len(sys.argv) > 1:
-        sys.exit(main(sys.argv[1]))
+        sys.stderr.write("uso: python excel_ai.py planilha.xlsx [--celula Aba!B5]  |  python excel_ai.py antiga.xlsx nova.xlsx --diff  |  python excel_ai.py pasta\n")
+        sys.exit(2)
     autoteste()

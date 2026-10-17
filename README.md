@@ -4,6 +4,7 @@ Transforma uma planilha Excel (calculadoras financeiras, PROCX entre abas, fluxo
 
 - Fórmulas repetidas viram uma linha só (`E2:E361 =C2*G2`), com as exceções listadas.
 - Cada bloco ganha o nome do cabeçalho mais perto (`E2:E361 [Juros] =C2*G2`), para a IA saber o que a conta é.
+- Cada bloco de 2+ celulas mostra o valor que o Excel calculou na primeira celula (`E2:E361 [Juros] (v 12.5) =C2*G2`): so uma dica, a formula nao muda.
 - Rótulos de texto ficam inteiros. Tabelas grandes de números viram resumo (faixa, mín, máx, primeiros valores).
 - Mapa das abas: quem usa quem, abas ocultas, tabelas, nomes definidos.
 - Avisos: `#REF!`, erros, `DESLOC`/`INDIRETO`, macros.
@@ -30,6 +31,30 @@ python excel_ai.py sua_planilha.xlsx
 
 Gera `sua_planilha.ai.txt` ao lado da planilha. É esse arquivo que você manda para a IA.
 Na tela aparecem só números: tokens antes e depois, e o resultado da conferência.
+
+Para olhar uma conta só (por exemplo a TIR final), passe a célula:
+
+```
+python excel_ai.py sua_planilha.xlsx --celula "Resumo!B5"
+```
+
+Gera `sua_planilha.Resumo_B5.ai.txt` só com as fórmulas e entradas de que essa célula depende, em todas as abas.
+
+Para ver o que mudou entre duas versões (por exemplo v7.3 e v7.4), passe as duas e `--diff`:
+
+```
+python excel_ai.py v7.3.xlsx v7.4.xlsx --diff
+```
+
+Gera `v7.4.vs_v7.3.diff.ai.txt` só com o que mudou: abas novas ou removidas, fórmulas novas ou alteradas (com a fórmula antiga ao lado) e constantes alteradas. O que não mudou fica de fora. Se inserir linhas ou colunas, muita coisa aparece como mudança.
+
+Para converter todas as planilhas de uma pasta (sem entrar em subpastas):
+
+```
+python excel_ai.py minha_pasta
+```
+
+Cada `.xlsx`/`.xlsm` gera o seu `.ai.txt` ao lado. Se uma falhar, as outras seguem.
 
 Sem argumento, roda o auto-teste:
 
