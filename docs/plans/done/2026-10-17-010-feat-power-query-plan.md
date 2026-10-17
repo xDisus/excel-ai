@@ -3,6 +3,7 @@ title: "feat: Read Power Query (M code)"
 type: feat
 date: 2026-10-17
 artifact_contract: ce-unified-plan/v1
+status: completed
 artifact_readiness: implementation-ready
 execution: code
 product_contract_source: ce-plan-bootstrap
@@ -113,8 +114,12 @@ R1 to R6 met, legend and README updated, auto-test green, existing fixture outpu
 
 ## Achados de execuções anteriores
 
-- Plano 008 (PR #14) entregou `redigir`, `ler_membro`, `xml_seguro`, `_injetar`, `bloco_livro` e a lista `secoes_livro` em `converter()` (emitida só quando `cadeia is None`). Para usar: `secoes_livro.append(linhas)`.
+- Plano 008 (PR #14) entregou `redigir`, `ler_membro`, `xml_seguro`, `_injetar`, `bloco_livro` e a lista `secoes_livro` em `converter()` (emitida só quando `cadeia is None`). Plano 011 mudou isso: `secoes_livro` é um dict, use `secoes_livro["Connections"|"Queries"|"Macros"] = ["## Nome"] + linhas`; a ordem fixa vem de `ORDEM_LIVRO`. Linha de legenda no cabeçalho só quando a seção existe (veja `External links` em `converter`).
 - `ler_membro` levanta `KeyError` (membro ausente) e `ValueError` (acima do teto); `xml_seguro` levanta `ValueError` (DOCTYPE ou XML ilegível). Capture os dois.
 - `redigir` é best-effort: valor sem aspas de `password=`/`key=` vai até `;`, `,`, `&` ou fim de linha; caminhos POSIX só em /home,/Users,/root,/mnt,/media,/var,/tmp,/opt. Nos testes, plante segredos reais (`hunter2`) e confira que sumiram E que o resto ficou.
 - Teste só com venv: `/tmp/claude-0/venv/bin/python excel_ai.py` (sem openpyxl no sistema). Mantenha o fonte em ASCII e compatível com Python 3.8.
 - Verificação R5: compare `converter()` de fixture, `--celula` e `--diff` contra a saída da `main` antes do plano.
+
+## Resultado da execução
+
+Entregue no PR #17 (base: feat/data-connections; depende de #14, #15, #16). Revisão: item cifrado/compressão estranha em `customXml` quebrava a conversão e `redigir` era lento em entrada hostil; corrigidos (`redigir` processa no máximo `MAX_REDIGIR` = 10000 caracteres). P2 abertos: `RE_SHARED` não é um lexer M (linha `shared X =` dentro de string divide a consulta); DataMashup acima de 5 MB é ignorado em silêncio. Validação em planilha real: pendente.

@@ -41,6 +41,20 @@ Se a planilha tem tabelas dinâmicas, o arquivo ganha uma seção `## Pivots` po
   values: Soma de Valor = sum(Valor)
 ```
 
+Se há links para outras planilhas (`=[1]Taxas!B2`), o final do arquivo ganha `# Workbook` / `## External links`: `[1] taxas.xlsx, sheets: T, 3 formulas`. Só o nome do arquivo aparece, nunca a pasta; o arquivo ligado não é aberto.
+
+Se há conexões de dados (banco, web, arquivo de texto), `## Connections` lista cada uma: tipo, servidor/banco (ou URL/arquivo), comando e se atualiza ao abrir. Usuário, senha e chaves nunca aparecem: da string de conexão só ficam servidor, banco, provedor, driver e fonte de dados.
+
+Se há Power Query, `## Queries` mostra o nome, onde cada consulta carrega (tabela da aba, só conexão, modelo de dados) e o código M como está escrito (até 2000 caracteres por consulta). O código não é executado. Caminhos viram nome de arquivo e senhas/chaves são mascaradas, mas é melhor olhar o arquivo antes de compartilhar.
+
+Se o arquivo tem macros VBA, `## Macros` lista os nomes dos módulos. Para ver também o código, passe `--macros-fonte`:
+
+```
+python excel_ai.py planilha.xlsm --macros-fonte
+```
+
+Aí cada módulo mostra os procedimentos, os destinos de células que o código escreve (`Sheet1.Range("B2").Value`) e o código como está escrito (4000 caracteres por módulo, 20000 no total). O código nunca é executado. Projeto com senha mostra só os nomes. Caminhos, URLs e valores depois de `password`/`token` são mascarados em melhor esforço: olhe antes de compartilhar.
+
 Para olhar uma conta só (por exemplo a TIR final), passe a célula:
 
 ```

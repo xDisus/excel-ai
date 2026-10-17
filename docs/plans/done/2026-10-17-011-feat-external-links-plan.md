@@ -3,6 +3,7 @@ title: "feat: List external workbook links"
 type: feat
 date: 2026-10-17
 artifact_contract: ce-unified-plan/v1
+status: completed
 artifact_readiness: implementation-ready
 execution: code
 product_contract_source: ce-plan-bootstrap
@@ -116,3 +117,7 @@ R1 to R7 met, legend and README updated, auto-test green, existing fixture outpu
 - `redigir` é best-effort: valor sem aspas de `password=`/`key=` vai até `;`, `,`, `&` ou fim de linha; caminhos POSIX só em /home,/Users,/root,/mnt,/media,/var,/tmp,/opt. Nos testes, plante segredos reais (`hunter2`) e confira que sumiram E que o resto ficou.
 - Teste só com venv: `/tmp/claude-0/venv/bin/python excel_ai.py` (sem openpyxl no sistema). Mantenha o fonte em ASCII e compatível com Python 3.8.
 - Verificação R5: compare `converter()` de fixture, `--celula` e `--diff` contra a saída da `main` antes do plano.
+
+## Resultado da execução
+
+Entregue no PR #15 (base: feat/pivot-tables, depende do #14). `secoes_livro` virou dict com ordem fixa `ORDEM_LIVRO`. Revisão: contagem por fórmula (não por ocorrência) e query de alvo local corrigidas. P2 abertos: `"[1]x"` dentro de string conta como uso; caminho de URL é mantido (só userinfo/query saem); nomes de aba do link não passam por `redigir`. Validação em planilha real: pendente.
