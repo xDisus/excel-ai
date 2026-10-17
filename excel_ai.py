@@ -4,6 +4,7 @@ Uso:   python excel_ai.py planilha.xlsx     (gera planilha.ai.txt ao lado)
        python excel_ai.py planilha.xlsx --celula "Aba!B5"   (so o que essa celula usa)
        python excel_ai.py antiga.xlsx nova.xlsx --diff      (so o que mudou entre as duas)
        python excel_ai.py pasta                             (todas as planilhas da pasta)
+       python excel_ai.py planilha.xlsm --macros-fonte      (inclui o codigo VBA; sem a opcao, so os nomes dos modulos)
        python excel_ai.py --instalar-skill [--forcar]       (instala a skill do Kiro em ~/.kiro/skills)
 Teste: python excel_ai.py                   (sem argumento roda o auto-teste)
 
@@ -50,6 +51,9 @@ LIMITE_CONEXOES = 100  # conexoes de dados por livro
 LIMITE_COMANDO = 200   # caracteres do comando (SQL) de cada conexao
 LIMITE_CONSULTAS = 50  # consultas Power Query por livro
 LIMITE_M = 2000        # caracteres do codigo M de cada consulta
+LIMITE_VBA = 4000      # caracteres de codigo de cada modulo VBA
+LIMITE_VBA_TOTAL = 20000  # idem, somando os modulos
+LIMITE_ESCRITAS = 50   # linhas 'escreve em celula' por modulo
 AMOSTRA = 3            # quantos primeiros valores o resumo mostra
 RATIO_DUPLICADA = 0.8  # fracao de formulas iguais para tratar a aba como copia
 ERROS = ("#N/A", "#REF!", "#VALUE!", "#DIV/0!", "#NAME?", "#NUM!", "#NULL!", "#SPILL!", "#CALC!")
@@ -646,6 +650,258 @@ def secao_consultas(fonte):
     return linhas
 
 
+CFB_ASSINATURA = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+CFB_FIM = 0xFFFFFFFE
+MAX_FLUXO = 5 * 2 ** 20   # bytes de um stream do container
+MAX_FLUXOS = 20 * 2 ** 20  # bytes de todos os streams juntos
+MAX_VBA_MODULO = 2 ** 20   # bytes descompactados de um modulo VBA
+MAX_DESCOMPACTADO = 8 * 2 ** 20  # idem, todos os modulos
+
+
+def cfb_streams(d):
+    """{caminho: bytes} dos streams de um container OLE/CFB (formato do vbaProject.bin). ValueError se invalido.
+    Entrada nao confiavel: toda cadeia tem teto e deteccao de ciclo, streams grandes demais sao pulados.
+    # ponytail: sem cadeia DIFAT (FAT acima de 109 setores, ~7 MB com setor de 512); reconstruir se um arquivo real pedir."""
+    if d[:8] != CFB_ASSINATURA or len(d) < 512:
+        raise ValueError("not a CFB container")
+    sh, msh = struct.unpack_from("<HH", d, 30)
+    if sh not in (9, 12) or msh != 6:
+        raise ValueError("unsupported sector size")
+    ss, ms = 1 << sh, 64
+    nfat, dir0, _, corte, mini0, nmini, _, ndifat = struct.unpack_from("<IIIIIIII", d, 44)
+    if ndifat or nfat > 109:
+        raise ValueError("DIFAT chain not supported")
+    limite = len(d) // ss + 1
+
+    def setor(i):
+        if (i + 2) * ss > len(d):
+            raise ValueError("sector beyond end of file")
+        return d[(i + 1) * ss:(i + 2) * ss]
+
+    def cadeia(ini, tabela, leitor, n=None):  # n: so os primeiros n setores (o stream declara quanto precisa)
+        partes, visto, i = [], set(), ini
+        while i != CFB_FIM and (n is None or len(partes) < n):
+            if i in visto or i >= len(tabela) or len(partes) > limite:
+                raise ValueError("bad sector chain")
+            visto.add(i)
+            partes.append(leitor(i))
+            i = tabela[i]
+        return b"".join(partes)
+
+    fat = []
+    for i in struct.unpack_from("<109I", d, 76)[:nfat]:
+        fat += struct.unpack("<%dI" % (ss // 4), setor(i))
+    diretorio = cadeia(dir0, fat, setor)
+    ent = []
+    for o in range(0, min(len(diretorio), 4096 * 128), 128):
+        nome, nlen, tipo = struct.unpack_from("<64sHB", diretorio, o)
+        esq, dir_, filho = struct.unpack_from("<III", diretorio, o + 68)
+        ini, tam = struct.unpack_from("<IQ", diretorio, o + 116)
+        ent.append((nome[:max(nlen - 2, 0)].decode("utf-16-le", "replace"), tipo, esq, dir_, filho, ini, tam & 0xFFFFFFFF))
+    if not ent:
+        raise ValueError("empty directory")
+    bruto = cadeia(mini0, fat, setor) if nmini else b""
+    minifat = struct.unpack("<%dI" % (len(bruto) // 4), bruto)
+    ministream = cadeia(ent[0][5], fat, setor)[:ent[0][6]] if ent[0][5] != CFB_FIM else b""
+
+    saida, visto, total, pilha = {}, set(), 0, [(ent[0][4], "")]
+    while pilha:
+        j, pref = pilha.pop()
+        if j == 0xFFFFFFFF:
+            continue
+        if j in visto or j >= len(ent):
+            raise ValueError("bad directory tree")
+        visto.add(j)
+        nome, tipo, esq, dir_, filho, ini, tam = ent[j]
+        pilha += [(esq, pref), (dir_, pref)]
+        if tipo == 1:
+            pilha.append((filho, pref + nome + "/"))
+        elif tipo == 2 and tam <= MAX_FLUXO:
+            total += tam
+            if total > MAX_FLUXOS:
+                raise ValueError("streams too large")
+            if not tam:
+                dados = b""
+            elif tam < corte:
+                dados = cadeia(ini, minifat, lambda i: ministream[i * ms:(i + 1) * ms], -(-tam // ms))
+            else:
+                dados = cadeia(ini, fat, setor, -(-tam // ss))
+            if len(dados) < tam:
+                raise ValueError("stream shorter than declared")
+            saida[pref + nome] = dados[:tam]
+    return saida
+
+
+def ovba_descomprimir(d, maximo=MAX_FLUXO):
+    """Descompacta um stream VBA (MS-OVBA 2.4.1). ValueError se corrompido ou grande demais."""
+    if not d or d[0] != 1:
+        raise ValueError("bad compression signature")
+    saida, pos = bytearray(), 1
+    while pos + 2 <= len(d):
+        cab = d[pos] | d[pos + 1] << 8
+        fim, comprimido, ini = min(pos + (cab & 0xFFF) + 3, len(d)), cab >> 15, len(saida)
+        if cab >> 12 & 7 != 3:
+            raise ValueError("bad chunk signature")
+        pos += 2
+        if not comprimido:
+            saida += d[pos:pos + 4096]
+            pos = fim
+            continue
+        while pos < fim:
+            marcas = d[pos]
+            pos += 1
+            for bit in range(8):
+                if pos >= fim:
+                    break
+                if not marcas >> bit & 1:
+                    saida.append(d[pos])
+                    pos += 1
+                    continue
+                if pos + 2 > fim or len(saida) == ini:
+                    raise ValueError("bad copy token")
+                tok = d[pos] | d[pos + 1] << 8
+                pos += 2
+                bits = 4
+                while 1 << bits < len(saida) - ini:
+                    bits += 1
+                desloc, tam = (tok >> (16 - bits)) + 1, (tok & (0xFFFF >> bits)) + 3
+                if desloc > len(saida) - ini:
+                    raise ValueError("bad copy offset")
+                for _ in range(tam):
+                    saida.append(saida[-desloc])
+        if len(saida) > maximo:
+            raise ValueError("decompressed stream too large")
+    return bytes(saida)
+
+
+def _texto_vba(b, cp):
+    try:
+        return b.decode(cp)
+    except (LookupError, UnicodeDecodeError):
+        return b.decode("latin-1")
+
+
+def _decifra_projeto(hexa):
+    """Dado de CMG=/DPB= do stream PROJECT (MS-OVBA 2.4.3.2, cifra com semente). ValueError se nao der."""
+    enc = bytes(bytearray.fromhex(hexa))
+    if len(enc) < 8:
+        raise ValueError("too short")
+    u1, e1, e2, saida = enc[0] ^ enc[2], enc[2], enc[1], bytearray()
+    for b in enc[3:]:
+        d = b ^ ((e2 + u1) & 0xFF)
+        e2, e1, u1 = e1, b, d
+        saida.append(d)
+    saida = saida[(enc[0] & 6) >> 1:]
+    return bytes(saida[4:4 + struct.unpack("<I", saida[:4])[0]])
+
+
+def projeto_protegido(projeto):
+    """True se o projeto VBA tem senha ou protecao de visualizacao. Excel escreve CMG/DPB em todo projeto
+    (sem senha eles decifram para 0), entao a mera presenca nao basta. Se existem mas nao decifram, conta como protegido."""
+    try:
+        cmg, dpb = (re.search(r'^%s="([0-9A-Fa-f]+)"' % k, projeto, re.M) for k in ("CMG", "DPB"))
+        return bool(cmg and any(_decifra_projeto(cmg.group(1)))) or bool(dpb and _decifra_projeto(dpb.group(1)) != b"\x00")
+    except (ValueError, IndexError, struct.error):
+        return True
+
+
+def vba_modulos(dir_bytes):
+    """[{nome, fluxo, offset, tipo}] do stream 'dir' ja descompactado (MS-OVBA 2.3.4.2): registros id(2) tamanho(4) dado."""
+    pos, cp, mods, atual = 0, "cp1252", [], None
+    while pos + 6 <= len(dir_bytes):
+        rid, n = struct.unpack_from("<HI", dir_bytes, pos)
+        dado = dir_bytes[pos + 6:pos + 6 + n]
+        pos += 6 + n + (2 if rid == 9 else 0)  # versao do projeto: 2 bytes alem do tamanho declarado
+        if rid == 3 and len(dado) == 2:
+            cp = "cp%d" % struct.unpack("<H", dado)[0]
+        elif rid == 0x19:
+            atual = {"nome": _texto_vba(dado, cp), "fluxo": _texto_vba(dado, cp), "offset": 0, "tipo": ""}
+            mods.append(atual)
+        elif atual is not None and rid == 0x1A:
+            atual["fluxo"] = _texto_vba(dado, cp)
+        elif atual is not None and rid == 0x31 and len(dado) == 4:
+            atual["offset"] = struct.unpack("<I", dado)[0]
+        elif atual is not None and rid in (0x21, 0x22):
+            atual["tipo"] = "module" if rid == 0x21 else "class or document"
+        elif rid == 0x2B:
+            atual = None
+        elif rid == 0x10:
+            break
+    return mods
+
+
+RE_PROCEDIMENTO = re.compile(r"^[ \t]*(?:(?:Public|Private|Friend|Static)\s+)*(Sub|Function|Property\s+(?:Get|Let|Set))\s+(\w+)", re.I | re.M)
+RE_ESCRITA = re.compile(r"^[ \t]*((?:\w+(?:\([^)\r\n]*\))?\.)*(?:(?:Range|Cells)\s*\(.*\)(?:\.\w+)*|\.(?:Value2?|Formula\w*)))\s*=(?!=)", re.I | re.M)
+
+
+def secao_macros(fonte, com_fonte=False):
+    """Linhas do ## Macros ([] se nao ha VBA ou nada deu para ler). Nunca executa nada.
+    Sem com_fonte so os nomes dos modulos; com ela tipo, procedimentos, escritas em celulas e o codigo (redigido e truncado)."""
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    try:
+        with zipfile.ZipFile(fonte) as z:
+            if "xl/vbaProject.bin" not in z.namelist():
+                return []
+            fluxos = cfb_streams(ler_membro(z, "xl/vbaProject.bin"))
+    except Exception:  # container ruim ou grande demais: fica so o aviso antigo
+        return []
+    nomes = sorted(n[4:] for n in fluxos if n.startswith("VBA/") and n[4:] not in ("dir", "_VBA_PROJECT") and not n[4:].startswith("__SRP_"))
+    projeto = fluxos.get("PROJECT", b"").decode("latin-1")
+    protegido = projeto_protegido(projeto)
+    tipos = {}
+    for chave, tipo in (("Module", "module"), ("Class", "class"), ("Document", "document"), ("BaseClass", "form")):
+        for nome in re.findall(r"^%s=([^/\r\n]+)" % chave, projeto, re.M):
+            tipos[nome] = tipo
+    limpa1 = lambda x: " ".join(redigir(x).split())
+    linhas = ["- VBA project is password protected: source never shown"] if protegido else []
+    if not com_fonte or protegido:
+        if nomes:
+            linhas.append("modules: " + ", ".join(limpa1(n) for n in nomes[:LIMITE_PIVOTS]) + (" (+%d more)" % (len(nomes) - LIMITE_PIVOTS) if len(nomes) > LIMITE_PIVOTS else ""))
+        if nomes and not protegido:
+            linhas.append("(source not shown: run with --macros-fonte)")
+        return linhas
+    try:
+        mods = vba_modulos(ovba_descomprimir(fluxos["VBA/dir"]))
+    except Exception:
+        return linhas + ["modules: " + ", ".join(limpa1(n) for n in nomes[:LIMITE_PIVOTS]), "(project index unreadable: no source)"]
+    usado = gasto = 0  # gasto: bytes descompactados (modulos podem apontar para o mesmo fluxo bomba)
+    for m in mods[:LIMITE_PIVOTS]:
+        nome = limpa1(m["nome"])
+        tipo = tipos.get(m["nome"]) or m["tipo"]
+        try:
+            if gasto >= MAX_DESCOMPACTADO:
+                raise ValueError("decompression budget used up")
+            gasto += MAX_VBA_MODULO  # pior caso; o real e devolvido abaixo
+            bruto = ovba_descomprimir(fluxos["VBA/" + m["fluxo"]][m["offset"]:], MAX_VBA_MODULO)
+            gasto += len(bruto) - MAX_VBA_MODULO
+            codigo = _texto_vba(bruto, "cp1252")[:MAX_VBA_MODULO]
+        except Exception:
+            linhas.append("- %s%s: source unreadable" % (nome, " (%s)" % tipo if tipo else ""))
+            continue
+        codigo = "\n".join(l for l in codigo.splitlines() if not l.startswith("Attribute VB_"))
+        procs = ["%s %s" % (a.split()[0], b) for a, b in RE_PROCEDIMENTO.findall(codigo)]
+        linhas.append("- %s%s%s" % (nome, " (%s)" % tipo if tipo else "", ": " + ", ".join(procs) if procs else ""))
+        escritas = list(dict.fromkeys(limpa1(x.group(1))[:120] for x in RE_ESCRITA.finditer(codigo)))  # so o destino, sem repetir
+        if escritas:
+            linhas.append("  writes to cells:")
+            linhas += ["    " + e for e in escritas[:LIMITE_ESCRITAS]]
+            if len(escritas) > LIMITE_ESCRITAS:
+                linhas.append("    (+%d more)" % (len(escritas) - LIMITE_ESCRITAS))
+        codigo = redigir(codigo.strip())
+        if not codigo:
+            continue
+        if usado >= LIMITE_VBA_TOTAL:
+            linhas.append("  (source omitted: total cap of %d characters reached)" % LIMITE_VBA_TOTAL)
+            continue
+        codigo = codigo[:min(LIMITE_VBA, LIMITE_VBA_TOTAL - usado)] + ("...(truncated)" if len(codigo) > min(LIMITE_VBA, LIMITE_VBA_TOTAL - usado) else "")
+        usado += len(codigo)
+        linhas += ["  source:"] + ["    " + l for l in codigo.splitlines()]
+    if len(mods) > LIMITE_PIVOTS:
+        linhas.append("(+%d more modules)" % (len(mods) - LIMITE_PIVOTS))
+    return linhas
+
+
 def links_externos(wb, textos):
     """(linhas, avisos) dos links para outras planilhas, na ordem de [N] nas formulas. Nunca abre o arquivo ligado.
     textos = todas as formulas do livro, para contar o uso de cada [N]. wb._external_links nao e API publica."""
@@ -996,9 +1252,9 @@ def secao_pivots(ws):
     return linhas, avisos
 
 
-def converter(fonte, alvo=None):
+def converter(fonte, alvo=None, macros_fonte=False):
     """Retorna (texto, numeros). fonte = caminho ou arquivo aberto.
-    alvo = "Aba!B5": so a cadeia de precedentes dessa celula."""
+    alvo = "Aba!B5": so a cadeia de precedentes dessa celula. macros_fonte: mostra o codigo VBA (## Macros)."""
     if hasattr(fonte, "seek"):
         fonte.seek(0)
     wb = load_workbook(fonte)
@@ -1110,6 +1366,9 @@ def converter(fonte, alvo=None):
         corpo += bloco
 
     if cadeia is None:
+        macros = secao_macros(fonte, macros_fonte)
+        if macros:
+            secoes_livro["Macros"] = ["## Macros"] + macros
         queries = secao_consultas(fonte)
         if queries:
             secoes_livro["Queries"] = ["## Queries"] + queries
@@ -1151,6 +1410,8 @@ def converter(fonte, alvo=None):
         cabeca.append("'## Pivots' lists pivot tables: where each sits, what feeds it, and which fields are rows, columns, filters and values.")
     if "Connections" in secoes_livro:
         cabeca.append("'## Connections' (after the last sheet) lists data connections (database, web, text file): sheets fed by them hold loaded data that may be stale. Credentials are never shown.")
+    if "Macros" in secoes_livro:
+        cabeca.append("'## Macros' (after the last sheet) lists the VBA modules; code is shown as written, never run, and only with --macros-fonte.")
     if "Queries" in secoes_livro:
         cabeca.append("'## Queries' (after the last sheet) has the Power Query M code as written, never run; review it before sharing.")
     if "External links" in secoes_livro:
@@ -1310,12 +1571,12 @@ def main_diff(antiga, nova):
     return 1 if n["falhas"] else 0
 
 
-def main(caminho, alvo=None):
+def main(caminho, alvo=None, macros_fonte=False):
     if not os.path.isfile(caminho):
         sys.stderr.write("erro: arquivo nao encontrado: %s\n" % ascii(caminho))
         return 2
     try:
-        texto, n = converter(caminho, alvo)
+        texto, n = converter(caminho, alvo, macros_fonte)
     except ValueError as e:
         sys.stderr.write("erro: %s\n" % ascii(str(e)))
         return 2
@@ -1347,7 +1608,7 @@ def main(caminho, alvo=None):
     return 1 if n["falhas"] else 0
 
 
-def main_pasta(pasta):
+def main_pasta(pasta, macros_fonte=False):
     """Converte cada planilha da pasta com main(); um arquivo ruim nao para os outros."""
     nomes = sorted(n for n in os.listdir(pasta)
                    if n.lower().endswith((".xlsx", ".xlsm")) and not n.startswith("~$")
@@ -1358,7 +1619,7 @@ def main_pasta(pasta):
     codigos = []
     for n in nomes:
         print("== %s ==" % n.encode("ascii", "backslashreplace").decode())
-        codigos.append(main(os.path.join(pasta, n)))
+        codigos.append(main(os.path.join(pasta, n), None, macros_fonte))
     print("Pasta: %d planilha(s), %d com problema" % (len(nomes), sum(1 for c in codigos if c)))
     return max(codigos)
 
@@ -1489,6 +1750,7 @@ Read `references/format.md` for the full legend. Short version:
 - After the last sheet, `# Workbook` holds workbook-level sections (only when present). `## External links`: `[1] taxas.xlsx, sheets: T, 3 formulas` says `[1]` in formulas (`=[1]T!B2`) is that file, shown by name only (no folder), with the cached sheet names and how many formulas use it. The linked file is never opened. Warnings flag links without saved values and links to URLs.
 - `## Connections` (in `# Workbook`, when present): one line per data connection: `'Name' (ODBC), source Server=db;Database=x, command SELECT ..., refreshes on open`. Sheets fed by a connection hold loaded data, not typed inputs; it may be stale. Only server/database/provider/driver/data-source parts of the connection string are kept, paths reduced to file names, URLs without query. Credentials never appear in the connection string; the `command` text is free text, redacted best-effort. Power Query connections (one per query) are counted in a single `Power Query: N connections` line; the queries themselves are in `## Queries`.
 - `## Queries` (in `# Workbook`, when present): each Power Query by name, where it loads (`loads to: sheet table X`, `connection only`, `data model`) and its M code, indented, as written (2000 characters max, 50 queries). The code is not run or interpreted: read `Source = ...` to see where data comes from. Paths are reduced to file names, URLs lose their query, values after password/token keys are masked, best-effort. `Queries present but unreadable` means the file has Power Query this tool could not unpack.
+- `## Macros` (in `# Workbook`, when the file has VBA): by default only `modules: A, B, C` (names). With `--macros-fonte`: one block per module `- Module1 (module): Sub A, Function B`, then `writes to cells:` (the distinct cell targets the code assigns, e.g. `Sheet1.Range("B2").Value`) and `source:` (indented, as written, 4000 characters per module and 20000 in total). The code is never run. A password-protected project lists names only. Use it to see which values a macro writes instead of a formula. Paths, URLs and values after password/token keys are masked, best-effort; review before sharing.
 
 Reason about the logic from the formulas: say what each block computes, which sheets feed it, and where inputs live. Use cached values `(v ...)` only as sanity checks; they may be stale.
 
@@ -1597,6 +1859,9 @@ One block per pivot table, after `## Notes`. `source` is a sheet range, `table o
         Source = Excel.Workbook(File.Contents("dados.xlsx"))
     in
         Source
+## Macros
+modules: Module1, Sheet1
+(source not shown: run with --macros-fonte)
 ## External links
 [1] taxas.xlsx, sheets: T, 3 formulas
 ```
@@ -1610,6 +1875,7 @@ Emitted once, after the last sheet, in this order when present: Connections, Que
 - `N formulas use OFFSET/INDIRECT` target decided at run time; not followable statically.
 - `N data-table (what-if) cells`.
 - `File has VBA macros`.
+- `VBA project is password protected: source never shown`.
 - `connection 'X' refreshes when the file opens`.
 - `Queries present but unreadable` (Power Query exists, could not be unpacked).
 - `external link [N] has no saved values` / `points to a URL`.
@@ -2217,19 +2483,199 @@ def autoteste():
                  b'<!DOCTYPE DataMashup [<!ENTITY e "x">]><DataMashup>&e;</DataMashup>'):
         assert secao_consultas(_injetar(_fixture(), {"customXml/item1.xml": ruim})) == ["Queries present but unreadable"]
     assert "## Queries" not in converter(_injetar(_fixture(), {"customXml/item1.xml": b"<outra/>"}))[0]
+    # macros: container CFB e compressao OVBA sinteticos (o mesmo codigo foi validado a mao num .xlsm real, nao versionado)
+    def _cfb(fluxos):
+        ss, FIM, LIVRE, FATSEC = 512, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFD
+        pastas = sorted({c.rpartition("/")[0] for c in fluxos if "/" in c})
+        ent = [["Root Entry", 5, b"", 0]] + [[p, 1, b"", 0] for p in pastas]
+        for c, d in sorted(fluxos.items()):
+            pai, _, nome = c.rpartition("/")
+            ent.append([nome, 2, d, pastas.index(pai) + 1 if pai else 0])
+        fat, setores, inicio = [FATSEC], [], {}  # o setor 0 e a FAT
+
+        def aloca(dados):
+            n = -(-len(dados) // ss)
+            ini = len(setores) + 1
+            for k in range(n):
+                setores.append(dados[k * ss:(k + 1) * ss].ljust(ss, b"\0"))
+                fat.append(ini + k + 1 if k < n - 1 else FIM)
+            return ini if n else FIM
+        ndir = -(-len(ent) * 128 // ss)
+        dir0 = aloca(b"\0" * ndir * ss)
+        mini, minifat = b"", []
+        for i, e_ in enumerate(ent):
+            if e_[1] == 2 and 0 < len(e_[2]) < 4096:  # pequeno: vai para o mini stream (setores de 64 bytes)
+                inicio[i] = len(minifat)
+                n = -(-len(e_[2]) // 64)
+                minifat += [len(minifat) + k + 1 if k < n - 1 else FIM for k in range(n)]
+                mini += e_[2].ljust(n * 64, b"\0")
+        mini0 = aloca(struct.pack("<%dI" % len(minifat), *minifat)) if minifat else FIM
+        raiz_ini = aloca(mini)
+        for i, e_ in enumerate(ent):
+            if e_[1] == 2 and i not in inicio:
+                inicio[i] = aloca(e_[2]) if e_[2] else FIM
+        filhos = {}
+        for i, e_ in enumerate(ent[1:], 1):
+            filhos.setdefault(e_[3], []).append(i)
+        direita = {a: b for lst in filhos.values() for a, b in zip(lst, lst[1:])}
+        raw = bytearray()
+        for i, e_ in enumerate(ent):
+            nome = e_[0].encode("utf-16-le")
+            ini, tam = (raiz_ini, len(mini)) if i == 0 else (inicio.get(i, 0), len(e_[2]))
+            filho = filhos[i][0] if i in filhos else LIVRE
+            raw += struct.pack("<64sHBBIII16sI16sIQ", nome, len(nome) + 2, e_[1], 1, LIVRE, direita.get(i, LIVRE), filho, b"", 0, b"", ini, tam)
+        for k in range(ndir):
+            setores[dir0 - 1 + k] = bytes(raw[k * ss:(k + 1) * ss]).ljust(ss, b"\0")
+        cab = struct.pack("<8s16sHHHHH6sIIIIIIIII", CFB_ASSINATURA, b"", 0x3E, 3, 0xFFFE, 9, 6, b"", 0, 1, dir0, 0, 4096,
+                          mini0, -(-len(minifat) * 4 // ss) if minifat else 0, FIM, 0) + struct.pack("<109I", 0, *([LIVRE] * 108))
+        assert len(fat) <= 128
+        return cab + struct.pack("<128I", *(fat + [LIVRE] * (128 - len(fat)))) + b"".join(setores)
+
+    def _ovba_bytes(d):  # compressao so com literais (blocos de 3000 bytes), o bastante para a ida e volta
+        saida = bytearray([1])
+        for i in range(0, max(len(d), 1), 3000):
+            cmp_ = bytearray()
+            for j in range(i, min(i + 3000, len(d)), 8):
+                cmp_ += b"\0" + d[j:j + 8]
+            saida += struct.pack("<H", 0xB000 | (len(cmp_) + 2 - 3)) + cmp_
+        return bytes(saida)
+    _ovba = lambda texto: _ovba_bytes(texto.encode("cp1252"))
+
+    def _dir(mods):
+        r = lambda i, d=b"": struct.pack("<HI", i, len(d)) + d
+        b = r(3, struct.pack("<H", 1252)) + r(9, struct.pack("<I", 1)) + b"\0\0" + r(0x0F, struct.pack("<H", len(mods)))
+        for nome, off, tipo in mods:
+            n = nome.encode("cp1252")
+            b += r(0x19, n) + r(0x1A, n) + r(0x31, struct.pack("<I", off)) + r(tipo) + r(0x2B)
+        return _ovba_bytes(b + r(0x10))
+
+    def _cifra(dados, semente=0x1F, chave=0x55):  # inverso de _decifra_projeto
+        plano = b"\0" * ((semente & 6) >> 1) + struct.pack("<I", len(dados)) + dados
+        u1, e1, e2, saida = chave, chave ^ semente, 2 ^ semente, bytearray([semente, 2 ^ semente, chave ^ semente])
+        for p in plano:
+            c = p ^ ((e2 + u1) & 0xFF)
+            saida.append(c)
+            e2, e1, u1 = e1, c, p
+        return saida.hex().upper()
+
+    def _vba(modulos, protegido=False, extra=None):
+        """modulos: [(nome, tipo 0x21|0x22, codigo)] -> bytes de um vbaProject.bin sintetico (7 bytes de 'cache' antes do codigo)."""
+        fl = {"VBA/_VBA_PROJECT": b"\1\2", "VBA/__SRP_0": b"zz", "VBA/dir": _dir([(n, 7, t) for n, t, _ in modulos])}
+        for n, t, c in modulos:
+            fl["VBA/" + n] = b"\xaa" * 7 + _ovba(c)
+        cmg, dpb = (_cifra(b"\1\0\0\0"), _cifra(b"\1")) if protegido else (_cifra(b"\0\0\0\0"), _cifra(b"\0"))
+        fl["PROJECT"] = ('ID="{X}"\r\nModule=%s\r\nDocument=Plan1/&H00000000\r\nCMG="%s"\r\nDPB="%s"\r\n' % (modulos[0][0], cmg, dpb)).encode("latin-1")
+        fl.update(extra or {})
+        return _cfb(fl)
+
+    # ovba: exemplo feito a mao (3 literais + 1 copia de 9 bytes a 3 de distancia) e ida e volta
+    assert ovba_descomprimir(bytes.fromhex("0105b008616263" "0620")) == b"abcabcabcabc"
+    longo = "Sub A()\r\n" + "x = 1 'comentario\r\n" * 500
+    assert ovba_descomprimir(_ovba(longo)).decode("cp1252") == longo and len(_ovba(longo)) > 8000
+    for ruim in (b"", bytes.fromhex("020005b0"), bytes.fromhex("0105b00861626306"),  # sem assinatura; copia cortada
+                 bytes.fromhex("0105b008616263ffff"), bytes.fromhex("0102b0010000")):  # distancia alem do inicio; copia sem nada antes
+        try:
+            ovba_descomprimir(ruim)
+            assert False, ruim
+        except ValueError:
+            pass
+    try:
+        ovba_descomprimir(_ovba("a" * 2000), maximo=100)
+        assert False, "teto nao aplicado"
+    except ValueError:
+        pass
+    # cfb: ida e volta com fluxo pequeno (mini stream), grande (FAT), aninhado, na raiz e vazio
+    flx = {"VBA/dir": b"d" * 100, "VBA/Mod1": bytes(range(256)) * 20, "PROJECT": b"P=1", "VBA/vazio": b""}
+    bom = _cfb(flx)
+    assert cfb_streams(bom) == flx, cfb_streams(bom).keys()
+    for ruim in (b"nao e cfb", bom[:600], bom[:512 * 3], bom[:72] + struct.pack("<I", 1) + bom[76:]):
+        try:
+            cfb_streams(ruim)
+            assert False, "container ruim aceito"
+        except ValueError:
+            pass
+    ciclo = bytearray(bom)
+    ciclo[512 + 4:512 + 8] = struct.pack("<I", 1)  # FAT[1] aponta para si mesmo (primeiro setor do diretorio)
+    try:
+        cfb_streams(bytes(ciclo))
+        assert False, "ciclo aceito"
+    except ValueError:
+        pass
+    # entrada hostil: orcamento de descompactacao entre modulos (varios apontando para o mesmo fluxo bomba), regex nao quadratica
+    import time
+    teto, globals()["MAX_DESCOMPACTADO"] = MAX_DESCOMPACTADO, 10
+    try:
+        orc = "\n".join(secao_macros(_injetar(_fixture(), {"xl/vbaProject.bin": _vba([("A1", 0x21, "Sub A()\r\nEnd Sub"), ("A2", 0x21, "Sub B()\r\nEnd Sub")])}), True))
+    finally:
+        globals()["MAX_DESCOMPACTADO"] = teto
+    assert "- A1 (module): Sub A" in orc and "- A2 (module): source unreadable" in orc, orc
+    t0 = time.time()
+    RE_ESCRITA.findall("\n" * 200000 + "a(ba(b" * 50000)
+    RE_PROCEDIMENTO.findall("\n" * 200000)
+    assert time.time() - t0 < 5, "regex quadratica"
+    # protecao: CMG/DPB sempre existem; sem senha decifram para zero (valores iguais aos de um arquivo real sem senha)
+    assert not projeto_protegido('CMG="1F1D3D73C5F315F715F715F715F7"\r\nDPB="6B6949C794C894C894"\r\nGC="B7B5959BADABF8ACF8AC07"')
+    assert projeto_protegido('CMG="%s"\r\nDPB="%s"' % (_cifra(b"\0\0\0\0"), _cifra(b"\x01\x02")))
+    assert projeto_protegido('CMG="%s"\r\nDPB="%s"' % (_cifra(b"\1\0\0\0"), _cifra(b"\0")))
+    assert projeto_protegido('CMG="ZZ"\r\nDPB="00"') and not projeto_protegido("sem nada")
+    # ## Macros ponta a ponta: nomes por padrao, codigo so com a opcao; segredos plantados somem, o resto fica
+    cod1 = ('Attribute VB_Name = "Modulo1"\r\nSub Gravar()\r\n    Sheets("A").Range("B2").Value = 5\r\n    Cells(1, 2) = 7\r\n    Range("B2").Value = 6\r\n'
+            '    If Range("C1") = 3 Then x = 1\r\n    .Value2 = 9\r\n    pwd = "hunter2"\r\n    Workbooks.Open "C:\\Users\\ana\\dados.xlsx"\r\nEnd Sub\r\n'
+            'Public Function Soma(a)\r\n    Soma = a\r\nEnd Function\r\n')
+    mods = [("Modulo1", 0x21, cod1), ("Plan1", 0x22, "x" * 6000), ("M\u00f3dulo2", 0x21, "Sub Z()\r\nEnd Sub\r\n")]
+    xm = _injetar(_fixture(), {"xl/vbaProject.bin": _vba(mods)})
+    nomes_m = secao_macros(xm)
+    assert nomes_m[1] == "(source not shown: run with --macros-fonte)" and len(nomes_m) == 2, nomes_m
+    assert set(nomes_m[0][len("modules: "):].split(", ")) == {"Modulo1", "Plan1", "M\u00f3dulo2"}, nomes_m
+    full = "\n".join(secao_macros(xm, True))
+    assert "- Modulo1 (module): Sub Gravar, Function Soma" in full and "- M\u00f3dulo2 (module): Sub Z" in full, full
+    assert 'writes to cells:\n    Sheets("A").Range("B2").Value\n    Cells(1, 2)\n    Range("B2").Value\n    .Value2\n  source:' in full, full
+    assert full.count("writes to cells:\n    Sheets") == 1 and "Attribute VB_Name" not in full and 'If Range("C1") = 3' in full
+    assert "dados.xlsx" in full and not any(k in full for k in ("hunter2", "ana", "Users")), full
+    assert "- Plan1 (document)" in full and "x" * 4000 + "...(truncated)" in full and "x" * 4001 not in full
+    muitos = [("Mod%d" % i, 0x21, "y%d = 1 " % i * 800) for i in range(8)]
+    tot = "\n".join(secao_macros(_injetar(_fixture(), {"xl/vbaProject.bin": _vba(muitos)}), True))
+    assert "source omitted: total cap of 20000" in tot and tot.count("...(truncated)") >= 1 and len(tot) < 24000
+    prot = secao_macros(_injetar(_fixture(), {"xl/vbaProject.bin": _vba(mods, protegido=True)}), True)
+    assert prot[0].startswith("- VBA project is password protected") and prot[1].startswith("modules: ") and len(prot) == 2, prot
+    # modulo com fluxo corrompido: so ele perde o codigo; dir ilegivel: so os nomes
+    quebrado = _vba(mods, extra={"VBA/Modulo1": b"\xaa" * 7 + b"\x01\xff\xff"})
+    assert "- Modulo1 (module): source unreadable" in "\n".join(secao_macros(_injetar(_fixture(), {"xl/vbaProject.bin": quebrado}), True))
+    sem_dir = secao_macros(_injetar(_fixture(), {"xl/vbaProject.bin": _vba(mods, extra={"VBA/dir": b"\x00"})}), True)
+    assert sem_dir[-1] == "(project index unreadable: no source)" and sem_dir[0].startswith("modules: ")
+    # R5: sem VBA, ou vbaProject.bin que nao e CFB: sem ## Macros, so o aviso antigo
+    assert secao_macros(_fixture()) == [] and secao_macros(io.BytesIO(b"nao zip")) == []
+    falso = converter(_injetar(_fixture(), {"xl/vbaProject.bin": b"x"}))[0]
+    assert "## Macros" not in falso and "File has VBA macros" in falso
+    txt, _ = converter(xm)
+    assert txt.split("\n# Workbook\n")[1].startswith("## Macros\nmodules: ") and "'## Macros' (after the last sheet)" in txt and "Sub Gravar" not in txt
+    assert "Sub Gravar" in converter(xm, None, True)[0] and "# Workbook" not in converter(xm, "Fluxo!D5")[0]
+    with tempfile.TemporaryDirectory() as td:  # a opcao pela linha de comando
+        caminho = os.path.join(td, "m.xlsm")
+        with open(caminho, "wb") as f_:
+            f_.write(xm.getvalue())
+        sys.stdout, saida_ = io.StringIO(), sys.stdout
+        try:
+            assert main(caminho, None, True) == 0
+        finally:
+            sys.stdout = saida_
+        assert "Sub Gravar" in open(os.path.join(td, "m.ai.txt"), encoding="utf-8").read()
     print("auto-teste ok")
 
 
 if __name__ == "__main__":
+    macros_fonte = "--macros-fonte" in sys.argv
+    if macros_fonte:
+        sys.argv.remove("--macros-fonte")
     if len(sys.argv) == 4 and sys.argv[2] == "--celula":
-        sys.exit(main(sys.argv[1], sys.argv[3]))
+        sys.exit(main(sys.argv[1], sys.argv[3], macros_fonte))
     if len(sys.argv) == 4 and sys.argv[3] == "--diff":
         sys.exit(main_diff(sys.argv[1], sys.argv[2]))
     if sys.argv[1:2] == ["--instalar-skill"] and len(sys.argv) <= 3:
         sys.exit(instalar_skill(forcar=sys.argv[2:] == ["--forcar"]))
     if len(sys.argv) == 2:
-        sys.exit(main_pasta(sys.argv[1]) if os.path.isdir(sys.argv[1]) else main(sys.argv[1]))
+        sys.exit(main_pasta(sys.argv[1], macros_fonte) if os.path.isdir(sys.argv[1]) else main(sys.argv[1], None, macros_fonte))
     if len(sys.argv) > 1:
-        sys.stderr.write("uso: python excel_ai.py planilha.xlsx [--celula Aba!B5]  |  python excel_ai.py antiga.xlsx nova.xlsx --diff  |  python excel_ai.py pasta  |  python excel_ai.py --instalar-skill [--forcar]\n")
+        sys.stderr.write("uso: python excel_ai.py planilha.xlsx [--celula Aba!B5] [--macros-fonte]  |  python excel_ai.py antiga.xlsx nova.xlsx --diff  |  python excel_ai.py pasta  |  python excel_ai.py --instalar-skill [--forcar]\n")
         sys.exit(2)
     autoteste()

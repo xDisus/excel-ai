@@ -3,8 +3,8 @@ title: "feat: Read VBA macros"
 type: feat
 date: 2026-10-17
 artifact_contract: ce-unified-plan/v1
-status: deferred
-artifact_readiness: deferred
+status: completed
+artifact_readiness: implementation-ready
 execution: code
 product_contract_source: ce-plan-bootstrap
 depth: deep
@@ -145,8 +145,15 @@ R1 to R7 met for the shipped tiers, caps enforced, legend and README updated, au
 - Teste só com venv: `/tmp/claude-0/venv/bin/python excel_ai.py` (sem openpyxl no sistema). Mantenha o fonte em ASCII e compatível com Python 3.8.
 - Verificação R5: compare `converter()` de fixture, `--celula` e `--diff` contra a saída da `main` antes do plano.
 
-## Resultado da execução (adiado, não implementado)
+## Resultado da execução
 
-Decisão do ship-plans, seguindo o gate KTD6: não há `.xlsm` real no repositório nem na máquina, então nem o leitor CFB (U1) nem a listagem de módulos (U2) poderiam ser validados contra o que o Excel realmente grava; um CFB sintético escrito por nós só prova que lemos o que nós mesmos escrevemos. U1+U2 sozinhos dão só nomes de módulos, pouco além do aviso atual (`File has VBA macros`), e acrescentam ~100 linhas de parser de formato binário em entrada não confiável. U3 (decompressão MS-OVBA e código-fonte) exige o mesmo arquivo real.
+Adiado uma vez (sem `.xlsm` real, gate KTD6) e depois entregue no PR #19, quando o usuário forneceu um `.xlsm` real (não versionado, confidencial). U1, U2 e U3 foram feitos e validados contra ele: leitor CFB (v3, 156 KB, mini stream, 40+ streams), descompressão MS-OVBA e `dir` (18 módulos, todos legíveis), código com acentos (cp1252), lista de escritas em células.
 
-**Para retomar:** precisa de um `.xlsm` real (pode ser anonimizado) fornecido pelo usuário, e que ele confirme que quer a leitura de macros. Depois: trocar `status`/`artifact_readiness` de volta para `implementation-ready`, e rodar `/ship-plans`. Os helpers `redigir`, `ler_membro` e `secoes_livro["Macros"]` já existem (plano 008/011).
+Achados da validação real:
+- `CMG=`/`DPB=` existem em todo projeto VBA; sem senha eles decifram para zero. Checar só a presença marcaria como protegido todo arquivo. `projeto_protegido` decifra (MS-OVBA 2.4.3.2) e só então decide.
+- O livro real tem uma conexão Power Query por consulta (184). Plano 009 listava todas; agora viram uma linha (`Power Query: N connections`).
+- `.SavePassword = False` é mascarado por `redigir` (excesso de cautela aceito).
+
+Revisão adversarial: regex quadrática em módulo hostil, bomba de descompressão repetida em vários módulos e cadeia CFB longa com tamanho 0 corrigidos (orçamento `MAX_DESCOMPACTADO`, `MAX_VBA_MODULO`, cadeia limitada ao tamanho declarado).
+
+P2 abertos: código sempre decodificado como cp1252 (não usa a code page do projeto); sem cadeia DIFAT (container acima de ~7 MB é rejeitado); `--macros-fonte` ainda não alcança o modo `--diff`.
