@@ -513,14 +513,17 @@ def conexoes(fonte):
         return [], ["- connections.xml skipped: %s" % redigir(" ".join(str(e).split()))[:100]]
     una = lambda x: " ".join(redigir(str(x)).split())
     todas = [c for c in raiz.iter() if c.tag.rpartition("}")[2] == "connection"]
-    linhas, avisos = [], []
-    for c in todas[:LIMITE_CONEXOES]:
+    linhas, avisos, n_pq, extra = [], [], 0, 0
+    for c in todas:
         filho = lambda tag: next((f for f in c if f.tag.rpartition("}")[2] == tag), None)
         db, web, txt = filho("dbPr"), filho("webPr"), filho("textPr")
         nome = una(c.get("name") or "id %s" % c.get("id", "?"))
         cadeia = (db.get("connection") if db is not None else "") or ""
         if "microsoft.mashup" in cadeia.lower():
-            linhas.append("- Power Query: %s" % nome)  # detalhes: ## Queries
+            n_pq += 1  # uma conexao por consulta (centenas num livro grande); detalhes em ## Queries
+            continue
+        if len(linhas) >= LIMITE_CONEXOES:
+            extra += 1
             continue
         tipo = c.get("type", "")
         partes = ["- '%s' (%s)" % (nome, TIPO_CONEXAO.get(int(tipo), "type %s" % tipo) if re.fullmatch(r"[0-9]+", tipo) else "type unknown")]
@@ -537,8 +540,10 @@ def conexoes(fonte):
         if c.get("background") in ("1", "true"):
             partes.append("background refresh")
         linhas.append(", ".join(partes))
-    if len(todas) > LIMITE_CONEXOES:
-        linhas.append("(+%d more connections)" % (len(todas) - LIMITE_CONEXOES))
+    if extra:
+        linhas.append("(+%d more connections)" % extra)
+    if n_pq:
+        linhas.append("- Power Query: %d connection%s (the queries are in ## Queries)" % (n_pq, "s" if n_pq > 1 else ""))
     return linhas, avisos
 
 
@@ -1482,7 +1487,7 @@ Read `references/format.md` for the full legend. Short version:
 - Per sheet `## Notes` (only when present): the author's cell comments, `B5 note: <text>` (200 characters max, 100 per sheet). Treat them as the author's own explanation of assumptions.
 - Per sheet `## Pivots` (only when present): each pivot table with where it sits, its source and its row, column, filter and value fields (`values: Soma de Valor = sum(Valor)`). The numbers it produced are ordinary cells in `## Data`; this section says they are a summary of the source. A warning appears when it refreshes on open.
 - After the last sheet, `# Workbook` holds workbook-level sections (only when present). `## External links`: `[1] taxas.xlsx, sheets: T, 3 formulas` says `[1]` in formulas (`=[1]T!B2`) is that file, shown by name only (no folder), with the cached sheet names and how many formulas use it. The linked file is never opened. Warnings flag links without saved values and links to URLs.
-- `## Connections` (in `# Workbook`, when present): one line per data connection: `'Name' (ODBC), source Server=db;Database=x, command SELECT ..., refreshes on open`. Sheets fed by a connection hold loaded data, not typed inputs; it may be stale. Only server/database/provider/driver/data-source parts of the connection string are kept, paths reduced to file names, URLs without query. Credentials never appear in the connection string; the `command` text is free text, redacted best-effort. A Power Query connection shows as `Power Query: Name`.
+- `## Connections` (in `# Workbook`, when present): one line per data connection: `'Name' (ODBC), source Server=db;Database=x, command SELECT ..., refreshes on open`. Sheets fed by a connection hold loaded data, not typed inputs; it may be stale. Only server/database/provider/driver/data-source parts of the connection string are kept, paths reduced to file names, URLs without query. Credentials never appear in the connection string; the `command` text is free text, redacted best-effort. Power Query connections (one per query) are counted in a single `Power Query: N connections` line; the queries themselves are in `## Queries`.
 - `## Queries` (in `# Workbook`, when present): each Power Query by name, where it loads (`loads to: sheet table X`, `connection only`, `data model`) and its M code, indented, as written (2000 characters max, 50 queries). The code is not run or interpreted: read `Source = ...` to see where data comes from. Paths are reduced to file names, URLs lose their query, values after password/token keys are masked, best-effort. `Queries present but unreadable` means the file has Power Query this tool could not unpack.
 
 Reason about the logic from the formulas: say what each block computes, which sheets feed it, and where inputs live. Use cached values `(v ...)` only as sanity checks; they may be stale.
@@ -2157,11 +2162,11 @@ def autoteste():
     assert cons == ("## Connections\n"
                     "- 'Vendas' (ODBC), source Driver={SQL Server};Server=db;Database=x, command SELECT a FROM t -- PWD=***, refreshes on open, background refresh\n"
                     "- 'Acc' (OLE DB), source Provider=Microsoft.ACE.OLEDB;Data Source=x.accdb\n"
-                    "- 'Site' (text), source https://h.com/p\n- 'Arq' (text), source data.csv\n- Power Query: Q1\n"), cons
+                    "- 'Site' (text), source https://h.com/p\n- 'Arq' (text), source data.csv\n- Power Query: 1 connection (the queries are in ## Queries)\n"), cons
     assert not any(k in txt for k in ("ana", "hunter", "abc9", "zzz9", "Users")), txt
     assert "- connection 'Vendas' refreshes when the file opens" in txt and "'## Connections' (after the last sheet)" in txt
     assert "# Workbook" not in converter(_injetar(_fixture(), {"xl/connections.xml": cx}), "Fluxo!D5")[0]
-    assert len(conexoes(_injetar(_fixture(), {"xl/connections.xml": cx.replace(b"</connections>", b'<connection id="9" name="n"/>' * 100 + b"</connections>")}))[0]) == 101
+    assert len(conexoes(_injetar(_fixture(), {"xl/connections.xml": cx.replace(b"</connections>", b'<connection id="9" name="n"/>' * 100 + b"</connections>")}))[0]) == 102
     grande = b"<connections>" + b" " * (6 * 2 ** 20) + b"</connections>"
     assert "skipped" in conexoes(_injetar(_fixture(), {"xl/connections.xml": grande}))[1][0]
     assert "skipped" in conexoes(_injetar(_fixture(), {"xl/connections.xml": b'<!DOCTYPE a [<!ENTITY e "x">]><a/>'}))[1][0]
