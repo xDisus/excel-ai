@@ -22,7 +22,7 @@ Formulas alone do not say what they produced. Today the cached value is used onl
 ## Requirements
 
 - R1. A block line from `blocos()` shows `(v X)` between the optional `[label]` and the formula when the first cell has a cached value.
-- R2. Only the first cell of a block gets a value. `except` lines and array/diff lines get none (same scope rule as labels).
+- R2. Only the first cell of a block spanning 2+ cells gets a value (single cells measured +10.2% tokens on the real file, so they are left out; final +3.5%). `except` lines and array/diff lines get none (same scope rule as labels).
 - R3. X comes from `fmt()` of the cached value, with `)` removed, whitespace collapsed, cut to 20 chars. Missing cache, `None` or empty text means no hint.
 - R4. `expandir()` parses lines with or without the hint (`RE_BLOCO` gets one optional non-capturing group), so the round-trip stays 100% lossless.
 - R5. Works with `--celula`: the cache passed to `blocos()` is the unfiltered sheet cache.

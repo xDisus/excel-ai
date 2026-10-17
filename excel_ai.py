@@ -36,7 +36,7 @@ PECA_LINHA = re.compile(r"^(\$?)(\d+)$")
 # ponytail: regex pode achar nome de aba dentro de texto entre aspas; raro, so afeta o mapa.
 NOME_ABA = r"'((?:[^']|'')+)'|([^\W\d][\w.]*)"  # 'Aba com espaco' ou Aba
 RE_ABA = re.compile(r"(?<![#\w.\]])(?:%s)!" % NOME_ABA)
-RE_BLOCO = re.compile(r"^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))? (?:\[[^\]]*\] )?(=.*)$")
+RE_BLOCO = re.compile(r"^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))? (?:\[[^\]]*\] )?(?:\(v [^)]*\) )?(=.*)$")
 RE_MATRIZ = re.compile(r"^([A-Z]+\d+) array (\S+) \{(=.*)\}$")
 RE_EXCECAO = re.compile(r"^  except ([A-Z]+\d+) (.*)$")
 RE_SUMIU = re.compile(r"^([A-Z]+\d+) no formula$")
@@ -133,7 +133,14 @@ def rotulo(formulas, valores, r, c, dr, dc):
     return None
 
 
-def blocos(formulas, valores, vertical, buraco="blank", contexto=None):
+def valor_curto(v):
+    """Valor calculado em poucos caracteres, sem ')' (a dica '(v X)' nao entra na formula)."""
+    if v is None:
+        return ""
+    return " ".join(fmt(v).replace(")", "").split())[:20]
+
+
+def blocos(formulas, valores, vertical, buraco="blank", contexto=None, cache=None):
     """Junta celulas vizinhas com o mesmo padrao. Uma celula diferente no meio vira 'except'.
     contexto = (todas as formulas, todos os valores) da aba, so para achar rotulos."""
     todas, todos = contexto or (formulas, valores)
@@ -193,6 +200,9 @@ def blocos(formulas, valores, vertical, buraco="blank", contexto=None):
                 nome = rotulo(todas, todos, ini[0], ini[1], dr, dc)
             if nome:
                 faixa += " [%s]" % nome
+            dica = valor_curto((cache or {}).get(ini)) if p0 != p1 else ""  # celula sozinha: sem dica (custa token demais)
+            if dica:
+                faixa += " (v %s)" % dica
             saida.append("%s %s" % (faixa, limpa(formulas[ini][1])))
             for p in excecoes:
                 f = formulas.get(cel(p))
@@ -270,10 +280,11 @@ def confere(linhas, meu, base=None):
         return False
 
 
-def secao_formulas(formulas, valores, buraco="blank", contexto=None):
+def secao_formulas(formulas, valores, buraco="blank", contexto=None, cache=None):
     if not formulas:
         return []
-    return min(blocos(formulas, valores, True, buraco, contexto), blocos(formulas, valores, False, buraco, contexto),
+    return min(blocos(formulas, valores, True, buraco, contexto, cache),
+               blocos(formulas, valores, False, buraco, contexto, cache),
                key=lambda b: len("\n".join(b)))
 
 
@@ -672,7 +683,7 @@ def converter(fonte, alvo=None):
             mapa.append("  table %s %s columns: %s" % (t.displayName, t.ref, ", ".join(colunas)))
 
         # formulas
-        linhas_f = secao_formulas(formulas, valores, "blank" if cadeia is None else "not in chain", contexto)
+        linhas_f = secao_formulas(formulas, valores, "blank" if cadeia is None else "not in chain", contexto, cache)
         if not confere(linhas_f, meu):
             falhas.append(ws.title)
             linhas_f = por_celula(formulas)
@@ -716,6 +727,7 @@ def converter(fonte, alvo=None):
         "How to read formulas: '<range> <formula>' gives the formula of the first cell;",
         "the rest of the range is the same formula copied (Excel fill), refs shifting as usual.",
         "'[label]' after the range is the nearest text header (above a column, left of a row): a hint, not part of the formula.",
+        "'(v X)' is the value Excel last calculated for the first cell of the range: a hint, not part of the formula.",
         "'except <cell> ...' overrides one cell inside the range above it.",
         "'same formulas as X' means the sheet is a copy of X except the listed cells.",
     ]
@@ -917,6 +929,25 @@ def autoteste():
     assert blocos(um, {(3, 3): "TIR"}, True) == ["C4 [TIR] =A1"]  # nada a esquerda: olha acima
     assert blocos(um, {(4, 2): "Taxa", (3, 3): "TIR"}, True) == ["C4 [Taxa] =A1"]  # esquerda ganha
     assert expandir(["B5:B7 [Juros] =A5"]) == expandir(["B5:B7 =A5"])
+
+    # valor calculado: so o 1o da faixa, depois do rotulo; sem cache ou None = sem dica
+    fs = {(r, 2): ("f", "=A%d" % r, relativa("=A%d" % r, r, 2)) for r in range(5, 8)}
+    assert blocos(fs, {(4, 2): "Juros"}, True, cache={(5, 2): 12.5, (6, 2): 99})[0] == "B5:B7 [Juros] (v 12.5) =A5"
+    assert blocos(fs, {}, True, cache={(5, 2): 3})[0] == "B5:B7 (v 3) =A5"
+    assert blocos({(5, 2): fs[(5, 2)]}, {}, True, cache={(5, 2): 3})[0] == "B5 =A5"  # celula sozinha: sem dica
+    assert blocos(fs, {}, True, cache={(6, 2): 3})[0] == "B5:B7 =A5"  # 1a celula sem valor
+    assert blocos(fs, {}, True, cache={(5, 2): None})[0] == "B5:B7 =A5"
+    assert blocos(fs, {}, True, cache={(5, 2): "a)b\nc  " + "x" * 30})[0] == "B5:B7 (v ab c xxxxxxxxxxxxxxx) =A5"
+    assert blocos(fs, {}, True, cache={(5, 2): "#N/A"})[0] == "B5:B7 (v #N/A) =A5"
+    assert blocos(fs, {}, True, cache={(5, 2): True})[0] == "B5:B7 (v TRUE) =A5"
+    assert blocos(fs, {}, True)[0] == "B5:B7 =A5"
+    fx = dict(fs)
+    fx[(6, 2)] = ("f", "=Z1", relativa("=Z1", 6, 2))
+    assert not any("(v" in l for l in blocos(fx, {}, True, cache={(5, 2): 1, (6, 2): 2}) if l.startswith("  except"))
+    assert expandir(["B5:B7 [Juros] (v 12.5) =A5"]) == expandir(["B5:B7 =A5"])
+    assert expandir(["B5 (v 1) =A5"]) == {"B5": "=A5"}
+    assert not confere(["B5:B7 (v 1) =A5"], {"B5": "=A5", "B6": "=A6", "B7": "=A8"})
+    assert not confere(["B5:B7 (v 1 =A5"], {"B5": "=A5", "B6": "=A6", "B7": "=A7"})
     certo = {"D%d" % r: "=B%d*C%d" % (r, r) for r in range(2, 11)}
     assert confere(["D2:D10 [J] =B2*C2"], certo) and not confere(["D2:D10 [J] =B2*C3"], certo)
     assert not confere(["D2:D10 [J =B2*C2"], certo)  # rotulo mal fechado nao passa
