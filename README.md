@@ -3,6 +3,7 @@
 Transforma uma planilha Excel (calculadoras financeiras, PROCX entre abas, fluxos, TIR) em um texto compacto que uma IA lê rápido e entende.
 
 - Fórmulas repetidas viram uma linha só (`E2:E361 =C2*G2`), com as exceções listadas.
+- Cada bloco ganha o nome do cabeçalho mais perto (`E2:E361 [Juros] =C2*G2`), para a IA saber o que a conta é.
 - Rótulos de texto ficam inteiros. Tabelas grandes de números viram resumo (faixa, mín, máx, primeiros valores).
 - Mapa das abas: quem usa quem, abas ocultas, tabelas, nomes definidos.
 - Avisos: `#REF!`, erros, `DESLOC`/`INDIRETO`, macros.
