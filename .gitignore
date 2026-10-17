@@ -1,0 +1,4 @@
+# planilhas e saidas reais nunca entram no repo (repo publico)
+*.xls*
+*.ai.txt
+__pycache__/
