@@ -18,6 +18,7 @@ from openpyxl.formula import Tokenizer
 from openpyxl.formula.tokenizer import Token
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.utils.cell import coordinate_from_string
 
 LIMITE_NUMEROS = 10    # sequencias de numeros/datas maiores que isso viram resumo
 LIMITE_TEXTOS = 50     # idem para textos (menor que isso costuma ser rotulo; fica inteiro)
@@ -31,12 +32,13 @@ PECA_CELULA = re.compile(r"^(\$?)([A-Z]{1,3})(\$?)(\d+)$")
 PECA_COLUNA = re.compile(r"^(\$?)([A-Z]{1,3})$")
 PECA_LINHA = re.compile(r"^(\$?)(\d+)$")
 # ponytail: regex pode achar nome de aba dentro de texto entre aspas; raro, so afeta o mapa.
-RE_ABA = re.compile(r"(?<![#\w.\]])(?:'((?:[^']|'')+)'|([^\W\d][\w.]*))!")
+NOME_ABA = r"'((?:[^']|'')+)'|([^\W\d][\w.]*)"  # 'Aba com espaco' ou Aba
+RE_ABA = re.compile(r"(?<![#\w.\]])(?:%s)!" % NOME_ABA)
 RE_BLOCO = re.compile(r"^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))? (=.*)$")
 RE_MATRIZ = re.compile(r"^([A-Z]+\d+) array \S+ \{(=.*)\}$")
 RE_EXCECAO = re.compile(r"^  except ([A-Z]+\d+) (.*)$")
 RE_SUMIU = re.compile(r"^([A-Z]+\d+) no formula$")
-RE_REF_QUEBRADA = re.compile(r"(?:(?:'(?:[^']|'')+'|[^\W\d][\w.]*)!)?#REF!")
+RE_REF_QUEBRADA = re.compile(r"(?:(?:%s)!)?#REF!" % NOME_ABA)
 
 
 def tokens(texto):
@@ -67,7 +69,7 @@ def fmt(v):
 
 def formula_de(v):
     """('f', texto) formula comum, ('a', texto, faixa) matriz, ('d',) tabela de dados, None constante."""
-    nome = type(v).__name__
+    nome = type(v).__name__  # por nome: DataTableFormula nao existe em openpyxl < 3.1
     if nome == "ArrayFormula":
         texto = v.text if v.text.startswith("=") else "=" + v.text
         return ("a", texto, v.ref)
@@ -156,8 +158,7 @@ def blocos(formulas, valores, vertical, buraco="blank"):
         for tipo, _, p0, p1, excecoes in pilha:
             ini = cel(p0)
             if tipo == "a":
-                f = formulas[ini]
-                saida.append("%s array %s {%s}" % (ref(*ini), f[2], limpa(f[1])))
+                saida.append(linha_formula(ini, formulas[ini]))
             if tipo != "f":
                 continue
             faixa = ref(*ini) if p0 == p1 else ref(*ini) + ":" + ref(*cel(p1))
@@ -237,21 +238,21 @@ def secao_formulas(formulas, valores, buraco="blank"):
 
 def por_celula(formulas):
     """Plano B: uma linha por formula (sempre sem perda)."""
-    saida = []
-    for (r, c) in sorted(formulas):
-        f = formulas[(r, c)]
-        if f[0] == "a":
-            saida.append("%s array %s {%s}" % (ref(r, c), f[2], limpa(f[1])))
-        elif f[0] == "f":
-            saida.append("%s %s" % (ref(r, c), limpa(f[1])))
-    return saida
+    return [linha_formula(pos, formulas[pos]) for pos in sorted(formulas) if formulas[pos][0] in "fa"]
+
+
+def linha_formula(pos, f):
+    """Uma celula na secao de formulas, no formato que expandir() le."""
+    if f[0] == "a":
+        return "%s array %s {%s}" % (ref(*pos), f[2], limpa(f[1]))
+    return "%s %s" % (ref(*pos), limpa(f[1]))
 
 
 def diferenca(formulas, meu, base_nome, base):
     """'same formulas as X' + so as celulas que mudam, tambem agrupadas em blocos."""
     mudou = {pos: f for pos, f in formulas.items()
              if f[0] in "fa" and base.get(ref(*pos)) != limpa(f[1])}
-    sumiu = sorted((k for k in base if k not in meu), key=lambda k: (int(re.sub(r"\D", "", k)), k))
+    sumiu = sorted((k for k in base if k not in meu), key=lambda k: (coordinate_from_string(k)[1], k))
     return (["same formulas as '%s', except:" % base_nome]
             + secao_formulas(mudou, {}, buraco="unchanged")
             + ["%s no formula" % k for k in sumiu])
@@ -359,7 +360,7 @@ def converter(fonte):
     wb_v = load_workbook(fonte, read_only=True, data_only=True)
 
     avisos, mapa, corpo = [], [], []
-    bruto = []
+    bruto_chars = 0  # tamanho do dump celula a celula (so para a comparacao)
     falhas, total_formulas, sem_cache = [], 0, True
     ja_vistas = []  # (nome, esperado) das abas anteriores
     s_form = s_dados = 0
@@ -379,12 +380,13 @@ def converter(fonte):
                 pos = (c.row, c.column)
                 if f is None:
                     valores[pos] = c.value
-                    bruto.append("%s\t%s" % (ref(*pos), fmt(c.value)))
+                    bruto_chars += len("%s\t%s" % (ref(*pos), fmt(c.value))) + 1
                 else:
                     if f[0] == "f":
                         f = f + (relativa(f[1], c.row, c.column),)
                     formulas[pos] = f
-                    bruto.append("%s\t%s\t%s" % (ref(*pos), f[1] if len(f) > 1 else "TABLE()", cache.get(pos)))
+                    bruto_chars += len("%s\t%s\t%s" % (ref(*pos), f[1] if len(f) > 1 else "TABLE()",
+                                                      cache.get(pos))) + 1
         if any(pos in cache for pos in formulas):
             sem_cache = False
 
@@ -455,6 +457,7 @@ def converter(fonte):
         s_dados += tokens("\n".join(linhas_d))
         corpo += bloco
 
+    wb_v.close()  # read_only segura o arquivo aberto
     if tem_vba(fonte):
         avisos.insert(0, "- File has VBA macros: some values may be written by a macro, not by formulas.")
     if total_formulas and sem_cache:
@@ -477,7 +480,7 @@ def converter(fonte):
     texto_mapa = ["", "## Map"] + mapa
     texto = "\n".join(cabeca + texto_avisos + texto_mapa + corpo) + "\n"
     numeros = {
-        "bruto": tokens("\n".join(bruto)),
+        "bruto": max(bruto_chars - 1, 0) // 4,  # = tokens() do dump juntado com "\n"
         "novo": tokens(texto),
         "avisos": tokens("\n".join(texto_avisos)),
         "mapa": tokens("\n".join(texto_mapa)),
@@ -511,7 +514,7 @@ def main(caminho):
         print("Conferencia das formulas: FALHOU em %d aba(s); essas abas sairam celula a celula." % n["falhas"])
     else:
         print("Conferencia das formulas: 100%% (%s formulas sem perda)" % "{:,}".format(n["total_formulas"]))
-    print("Arquivo gerado: %s" % ascii(os.path.basename(destino)).strip("'"))
+    print("Arquivo gerado: %s" % os.path.basename(destino).encode("ascii", "backslashreplace").decode())
     return 1 if n["falhas"] else 0
 
 
@@ -622,7 +625,6 @@ def autoteste():
     assert "A1 Taxa | B1 0.012" in texto
     # mapa e avisos
     assert "- 'Fluxo' A1:J101, 303 formulas, uses 'Premissas' (200), 'Plan Extra 2' (1)" in texto
-    assert "'Plan Extra 2' (1)" in texto
     assert "'Plan Extra 2' A1:B4, HIDDEN" in texto
     assert "  table Tabela1 A1:B4 columns: Nome, Valor" in texto
     assert "  TAXA2024 = Premissas!$B$1" in texto
