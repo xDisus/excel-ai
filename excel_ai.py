@@ -1355,6 +1355,10 @@ def autoteste():
     with zipfile.ZipFile(z, "w") as arq:
         arq.writestr("xl/vbaProject.bin", b"x")
     assert tem_vba(z) and not tem_vba(_fixture())
+    copia_skill = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kiro", "skills", "excel-ai", "scripts", "excel_ai.py")
+    if os.path.isfile(copia_skill):  # so no repo; quem copiou um arquivo so nao tem a pasta
+        with open(copia_skill, "rb") as a, open(os.path.abspath(__file__), "rb") as b:
+            assert a.read() == b.read(), "copia da skill Kiro desatualizada: cp excel_ai.py kiro/skills/excel-ai/scripts/"
     print("auto-teste ok")
 
 
